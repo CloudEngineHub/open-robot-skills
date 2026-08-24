@@ -18,6 +18,10 @@ gap:
     - geometry.mask_to_world_points: Back-project a 2D mask to 3D world points via depth + calibration.
     - geometry.pixel_to_world_point: Back-project a single pixel to a 3D world point.
     - geometry.transform_points: Apply a rigid SE(3) transform to 3D points.
+    - geometry.fit_planar_feature: Fit a 6D frame, normal, median radius, and robust inner/outer radii to a ring, loop, rim, or planar opening cloud.
+    - geometry.fit_linear_feature: Fit an axis and robust endpoints to a rod, peg, shaft, or hook cloud.
+    - geometry.cloud_to_attachment: Convert an observed object cloud into an attached collision model and object-to-TCP transform.
+    - geometry.compute_feature_mate: Compute metric approach, engagement, and seating poses for compatible held and fixture features.
     - geometry.exclude_robot_points: FK-sphere removal of robot-body points from a cloud (7-DOF Franka; other arms pass through).
     - geometry.filter_noise: DBSCAN noise filtering (keeps all non-noise points).
     - geometry.compute_obb: Fit an upright oriented bounding box to 3D points (HyRL fit).
@@ -26,7 +30,7 @@ gap:
     - geometry.top_down_grasp_candidates: Fan of top-down grasp candidates (canonical primary+alt first).
     - geometry.select_top_down_grasp: Pick the most top-down grasp from candidates.
     - geometry.front_grasp_from_obb: Front-approach grasp/pre-grasp for handles (drawers, doors).
-    - geometry.build_world_config: Reconstruct a collision world (alpha-shape scene mesh) from RGB-D.
+    - geometry.build_world_config: Reconstruct a multi-surface collision world from RGB-D; touching planes are separated into closed slabs, residual non-planar clusters are meshed independently, and optional live robot spheres remove self-returns before meshing.
     - geometry.rotate_quat_z90: Rotate a wxyz quaternion 90 degrees around world Z.
     - geometry.compute_drop_position: Drop position above a container OBB.
     - geometry.compute_xy_distance: XY-plane distance between two 3D points.
@@ -52,6 +56,11 @@ Fully CPU — no model weights, no GPU.
 - Building the collision world for the planner: `build_world_config` with the
   target's mask in `object_masks` so the planner can `ignore_obstacle_names`
   it.
+- Estimating feature geometry for constrained mating: use
+  `fit_planar_feature` for loops/openings and `fit_linear_feature` for
+  rods/pegs. Their axis signs are geometrically ambiguous, so pass a
+  workcell- or camera-derived `normal_hint` / `axis_hint` when direction
+  matters.
 
 ## Install
 
@@ -73,6 +82,10 @@ reconstruction need open3d/sklearn/cv2.
   OBB centers carry a few cm of depth bias on opaque objects. (The service's
   rehearsal-sandbox ground-truth snap that compensated for this in-container
   was deliberately NOT ported — it depended on a `/app` sandbox file.)
+- A fitted plane normal has two valid signs and a fitted line has two valid
+  directions. The feature-fit tools expose hints solely to resolve that sign;
+  callers must derive the hint from observed support geometry, camera viewing
+  direction, or a declared workcell frame rather than an evaluator target.
 - `top_down_grasp_candidates` default `z_offset=-0.04`: fingertip 4 cm below
   the OBB top. With `z_offset=0.0` the fingers close above the object
   (silent empty grip). Grasp Z is clamped to -0.05 m (table-clearance floor;
