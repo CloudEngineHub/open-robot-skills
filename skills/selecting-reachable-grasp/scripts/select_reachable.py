@@ -13,6 +13,13 @@ So the list is walked. Two gates, and they are different questions:
 * **reachable** — does IK solve this pose, and does the solution land near
   where it was asked to? A solver that returns its best effort is not the same
   as a solver that succeeded, and a pose missed by 15 cm is not a grasp.
+* **holdable** — can the arm hold the *roll* there? IK reaches a position and
+  an approach direction and leaves the wrist roll FREE on any robot that does
+  not declare ``honour_roll``, so a pose it solves happily can still be one the
+  arm cannot adopt the closing direction at. Measured: a candidate that passed
+  the IK gate then refused its own descent with "0 mm and 29 deg off" — the
+  position was perfect and the roll was not there. For a grasp the roll IS the
+  grasp, so this gate is on by default.
 * **clear** — is the arm, at that configuration, clear of the scene? This
   needs ``sim.clearance``, which the ``full`` tier has and the others do not,
   so its absence is a skipped gate rather than a refusal: a caller at
@@ -36,6 +43,14 @@ Twenty millimetres: wide enough not to reject a good solve on solver noise,
 tight enough that a pose the arm cannot actually reach does not pass. A
 backend that reports no error at all is trusted, because refusing every
 candidate on a missing field would turn a missing diagnostic into a failure."""
+
+_ROLL_TOLERANCE_RAD = 0.09
+"""How far the wrist roll may sit from the asked-for one and still count [rad].
+
+About five degrees, which is `motion.plan_linear(orientation="lock")`'s own
+gate -- so a candidate that passes here is one whose descent that call will
+accept, and one that fails here would have failed the descent anyway, later
+and after the arm had moved."""
 
 _CLEARANCE_FLOOR_M = 0.0
 """Contact-or-worse. The gap is a conservative floor -- every shape is carried
@@ -72,12 +87,21 @@ def _missed_by(result: Any) -> float | None:
     return None
 
 
+def _roll_error(result: Any) -> float | None:
+    if isinstance(result, dict):
+        value = result.get("rotation_error_rad")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
 def run(
     ctx: NodeContext,
     poses: list[Se3Pose],
     arm_id: int = 0,
     object_name: str = "",
     check_clearance: bool = True,
+    check_roll: bool = True,
 ) -> Output:
     """The first candidate in *poses* that IK solves and (where checkable) is clear.
 
@@ -108,6 +132,20 @@ def run(
         missed = _missed_by(solved)
         if missed is not None and missed > _POSITION_TOLERANCE_M:
             continue
+        if check_roll:
+            # `plan_joint(orientation="lock")` reports the roll it could reach
+            # rather than refusing, so this asks it and reads the number. A
+            # backend that reports nothing is trusted, on the same rule as the
+            # position gate: a missing diagnostic is not a failure.
+            try:
+                turn = ctx.tool(
+                    "motion.plan_joint", pose=pose, arm_id=arm_id, orientation="lock"
+                )
+                roll_off = _roll_error(turn)
+                if roll_off is not None and roll_off > _ROLL_TOLERANCE_RAD:
+                    continue
+            except Exception:
+                pass
         if check_clearance:
             try:
                 reading = ctx.tool(

@@ -11,6 +11,7 @@ gap:
   allowed_tools:
     - robot.solve_ik
     - robot.describe_arm
+    - motion.plan_joint
     - sim.clearance
   exit_conditions:
     selected: A pose the arm reaches, with the joint configuration that reaches it.
@@ -23,6 +24,13 @@ gap:
       effort; check the position error before trusting it. This skill rejects a
       solve that lands more than 20 mm from the request, which is the
       difference between a grasp and a gesture near one.
+    - >
+      `robot.solve_ik` reaches a position and an approach direction and leaves
+      the wrist ROLL free on any robot that does not declare `honour_roll`. For
+      a grasp the roll IS the grasp, so an IK solve alone does not mean the arm
+      can adopt the closing direction there. This skill checks it with
+      `motion.plan_joint(orientation="lock")` and reads `rotation_error_rad`;
+      do not switch `check_roll` off for a grasp.
     - >
       Pass `object_name` so the target is excluded from the clearance test.
       The whole point of a grasp is to approach the object, so counting it as
