@@ -25,6 +25,7 @@ gap:
     - curobo.batch_grasp_feasibility: Per-pose grasp/approach IK + corridor feasibility for a grasp batch.
     - curobo.validate_joint_trajectory_robot: Collision-validate joint waypoints (robot vs world + self).
     - curobo.validate_joint_trajectory_grasped: Same, with a grasped object attached at waypoint 0.
+    - curobo.cloud_to_attachment: MORPHIT collision spheres for a held object's cloud, in the TCP frame.
 ---
 
 # curobo

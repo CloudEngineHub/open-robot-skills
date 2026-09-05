@@ -5,7 +5,7 @@ license: Apache-2.0
 compatibility: requires gap>=0.1
 metadata: {category: perception, tags: [in-hand, registration, wrist-camera, collision]}
 gap:
-  allowed_tools: [robot.get_ee_pose, sam3.segment_text, geometry.mask_to_world_points, geometry.fit_planar_feature, geometry.cloud_to_attachment]
+  allowed_tools: [robot.get_ee_pose, sam3.segment_text, geometry.mask_to_world_points, geometry.fit_planar_feature, curobo.cloud_to_attachment, geometry.cloud_to_attachment]
   required_inputs: {reference_cloud: PointCloud, functional_feature: FunctionalFeature, object_description: string}
   produces_outputs: {feature_in_tcp: Se3Pose, object_in_tcp: Se3Pose, attached_object: AttachedObject, registration_confidence: float}
   exit_conditions:
@@ -62,10 +62,12 @@ graph that must stop on a weak registration routes on the confidence.
   complete pre-grasp cloud, carried as above; `"observed"` fits the accepted
   wrist cloud, falling back to the carried reference cloud when the wrist saw
   nothing usable. `object_in_tcp` is centred on the same cloud.
-- The attachment is `geometry.cloud_to_attachment(fit_type=attachment_fit_type,
-  surface_radius=0.002, margin=0.002, max_spheres=64)`: 64 MORPHIT spheres on
-  a watertight convex hull, radii contracted by 2 mm. `surface` and `voxel`
-  remain available for explicit fitting experiments only.
+- The attachment is `curobo.cloud_to_attachment(surface_radius=0.002,
+  margin=0.002, max_spheres=64)`: 64 MORPHIT spheres on a watertight convex
+  hull, radii contracted by 2 mm, fitted where cuRobo lives. An
+  `attachment_fit_type` of `surface` or `voxel` goes to
+  `geometry.cloud_to_attachment` instead, for explicit fitting experiments
+  only.
 - `camera_name_filter` (default `"eye_in_hand"`) is a substring the camera
   name must contain; set it to another camera name when a held object is
   better observed from an overview camera.

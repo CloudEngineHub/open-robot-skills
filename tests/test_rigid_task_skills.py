@@ -307,7 +307,7 @@ def test_register_held_fallback_still_builds_attachment():
     ctx = Context(
         {
             "robot.get_ee_pose": {"pose": pose()},
-            "geometry.cloud_to_attachment": {"attached_object": {"frame": "tcp", "spheres": []}},
+            "curobo.cloud_to_attachment": {"attached_object": {"frame": "tcp", "spheres": []}},
         }
     )
     out = module.run(ctx, [], cloud, {"pose": pose()}, "held object")
@@ -325,7 +325,7 @@ def _register_context(observed_cloud, attachment_calls, score=0.9):
             "robot.get_ee_pose": {"pose": pose()},
             "sam3.segment_text": {"masks": [np.ones((8, 8), np.uint8)], "scores": [score]},
             "geometry.mask_to_world_points": {"points": observed_cloud},
-            "geometry.cloud_to_attachment": attach,
+            "curobo.cloud_to_attachment": attach,
         }
     )
 
@@ -345,7 +345,7 @@ def test_register_held_attachment_source_selects_the_fitted_cloud():
         attachment_source="observed",
     )
     assert len(calls) == 1 and calls[0]["points"] is observed
-    assert calls[0]["fit_type"] == "morphit" and calls[0]["max_spheres"] == 64
+    assert "fit_type" not in calls[0] and calls[0]["max_spheres"] == 64  # MORPHIT: the curobo tool
     assert calls[0]["surface_radius"] == pytest.approx(0.002) and calls[0][
         "margin"
     ] == pytest.approx(0.002)
@@ -402,7 +402,7 @@ def test_register_held_grasp_pose_carries_the_reference_by_the_rigid_grasp_trans
         {
             "robot.get_ee_pose": {"pose": pose(x=0.5, z=0.35)},
             "sam3.segment_text": {"masks": [], "scores": []},
-            "geometry.cloud_to_attachment": attach,
+            "curobo.cloud_to_attachment": attach,
         }
     )
     out = module.run(ctx, [wrist_camera()], reference, feature, "tool", grasp_pose=grasp)
@@ -436,7 +436,7 @@ def test_register_held_directed_tip_replaces_the_fallback_feature():
             "robot.get_ee_pose": {"pose": pose()},
             "sam3.segment_text": segment,
             "geometry.mask_to_world_points": to_points,
-            "geometry.cloud_to_attachment": {"attached_object": {"frame": "tcp", "spheres": []}},
+            "curobo.cloud_to_attachment": {"attached_object": {"frame": "tcp", "spheres": []}},
         }
     )
     out = module.run(

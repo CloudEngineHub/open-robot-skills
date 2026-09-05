@@ -265,14 +265,19 @@ def run(
     attachment_cloud = cloud if attachment_source == "observed" else reference
     attachment = prior_attached_object
     if attachment is None:
+        # MORPHIT is cuRobo's fitter and lives in the curobo bundle; the CPU
+        # geometry bundle fits the surface and voxel kinds.
+        fit_kind = str(attachment_fit_type).strip().lower()
         attachment = ctx.tool(
-            "geometry.cloud_to_attachment",
+            "curobo.cloud_to_attachment"
+            if fit_kind == "morphit"
+            else "geometry.cloud_to_attachment",
             points=attachment_cloud,
             tcp_pose=ee,
-            fit_type=attachment_fit_type,
             surface_radius=0.002,
             margin=0.002,
             max_spheres=64,
+            **({} if fit_kind == "morphit" else {"fit_type": fit_kind}),
         )["attached_object"]
     if prior_object_in_tcp is not None:
         obj = world_tcp @ _matrix(prior_object_in_tcp)

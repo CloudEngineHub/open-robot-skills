@@ -435,7 +435,7 @@ def cloud_to_attachment(
     voxel_size: float = 0.008,
     max_spheres: int = 64,
     margin: float = 0.002,
-    fit_type: str = "morphit",
+    fit_type: str = "surface",
     surface_radius: float = 0.003,
 ) -> AttachmentResult:
     cloud = np.asarray(points["points"], dtype=np.float64).reshape(-1, 3)
@@ -447,34 +447,10 @@ def cloud_to_attachment(
     method = str(fit_type).strip().lower()
     count = max(1, int(max_spheres))
     if method == "morphit":
-        import trimesh
-        from curobo._src.geom.sphere_fit import SphereFitType, fit_spheres_to_mesh
-
-        mesh = trimesh.points.PointCloud(local).convex_hull
-        result = fit_spheres_to_mesh(
-            mesh,
-            num_spheres=count,
-            surface_radius=float(np.clip(surface_radius, 0.001, 0.010)),
-            fit_type=SphereFitType.MORPHIT,
-            iterations=200,
-            compute_metrics=True,
+        raise ValueError(
+            "fit_type 'morphit' is cuRobo's sphere fitter, which this CPU bundle "
+            "does not carry: call curobo.cloud_to_attachment"
         )
-        centers = result.centers.detach().cpu().numpy().reshape(-1, 3)
-        radii = result.radii.detach().cpu().numpy().reshape(-1)
-        shrink = float(max(0.0, margin))
-        radii = np.maximum(radii - shrink, 0.001)
-        valid = np.isfinite(centers).all(axis=1) & np.isfinite(radii) & (radii > 0.0)
-        if not np.any(valid):
-            raise RuntimeError("CuRobo MORPHIT fitting returned no attachment spheres")
-        return {"attached_object": {
-            "frame": "tcp",
-            "sphere_fit_type": "morphit",
-            "sphere_radius_shrink_m": shrink,
-            "spheres": [
-                {"center": _vec3(center), "radius": float(radius)}
-                for center, radius in zip(centers[valid], radii[valid])
-            ],
-        }}
     if method == "surface":
         radius = float(np.clip(surface_radius, 0.001, 0.010))
         # Deterministic farthest-point sampling preserves the measured surface
@@ -494,7 +470,7 @@ def cloud_to_attachment(
             for center, sphere_radius in spheres
         ]}}
     if method != "voxel":
-        raise ValueError("fit_type must be 'morphit', 'surface', or 'voxel'")
+        raise ValueError("fit_type must be 'surface' or 'voxel' (MORPHIT is curobo.cloud_to_attachment)")
     cells = np.floor(local / pitch).astype(np.int64)
     _, inverse = np.unique(cells, axis=0, return_inverse=True)
     spheres = []
