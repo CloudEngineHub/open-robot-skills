@@ -1,0 +1,23 @@
+{
+  "skill": "grasping-linear-feature",
+  "inputs": {"target_cloud": "PointCloud"},
+  "outputs": {
+    "grasp_pose": {"$ref": "compute_grasp.grasp_pose"},
+    "pregrasp_pose": {"$ref": "compute_grasp.pregrasp_pose"},
+    "approach_axis": {"$ref": "compute_grasp.approach_axis"},
+    "ee_pose_at_grasp": {"$ref": "observe.arms.0.ee_pose"}
+  },
+  "nodes": {
+    "open": {"type": "tool", "tool": "robot.open_gripper", "inputs": {"settle_steps": 40}},
+    "fit_axis": {"type": "tool", "tool": "geometry.fit_linear_feature", "inputs": {"points": {"$ref": "in.target_cloud"}}},
+    "compute_grasp": {"type": "script", "script": "scripts/axis_aware_grasp_pose.py", "inputs": {"feature_center": {"$ref": "fit_axis.center"}, "feature_axis": {"$ref": "fit_axis.axis"}, "standoff": 0.12, "surface_inset": 0.012}},
+    "pregrasp": {"type": "tool", "tool": "robot.go_to_pose", "inputs": {"pose": {"$ref": "compute_grasp.pregrasp_pose"}}},
+    "descend": {"type": "tool", "tool": "robot.go_to_pose", "inputs": {"pose": {"$ref": "compute_grasp.grasp_pose"}}},
+    "observe": {"type": "tool", "tool": "robot.get_observation", "inputs": {}},
+    "close": {"type": "tool", "tool": "robot.close_gripper", "inputs": {"settle_steps": 60}},
+    "grasped": {"type": "noop"}
+  },
+  "edges": [["START", "open"], ["open", "fit_axis"], ["fit_axis", "compute_grasp"], ["compute_grasp", "pregrasp"], ["pregrasp", "descend"], ["descend", "observe"], ["observe", "close"], ["close", "grasped"], ["grasped", "END"]],
+  "exit": {"router_field": null, "success_values": ["grasped"]},
+  "on_error": "failed"
+}
