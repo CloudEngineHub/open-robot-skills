@@ -11,7 +11,7 @@ The LLM pipeline composes these bundles into executable robot graphs;
 every bundle is one directory, one `SKILL.md`, one PR.
 
 [![Skills](https://img.shields.io/badge/skills-22-blue.svg)](#skills--what-the-robot-can-do)
-[![Tools](https://img.shields.io/badge/tool%20bundles-7-orange.svg)](#tools--what-the-robot-can-compute)
+[![Tools](https://img.shields.io/badge/tool%20bundles-8-orange.svg)](#tools--what-the-robot-can-compute)
 [![Format: Agent Skills](https://img.shields.io/badge/format-Agent%20Skills-purple.svg)](https://agentskills.io/specification)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing-a-bundle)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
@@ -81,6 +81,7 @@ bundle's own `pyproject.toml`), environment variables, weights, and quirks.
 | Bundle | Description | Tools | Extra |
 |---|---|---|---|
 | [curobo](tools/curobo/) | NVIDIA cuRobo motion planning — collision-free trajectories to grasp goalsets, transport with an attached object, constrained linear moves, single-pose planning, geometric IK, batch grasp feasibility, and joint-trajectory collision validation. | `curobo.batch_grasp_feasibility`, `curobo.plan_directed_linear`, `curobo.plan_grasp_motion`, `curobo.plan_linear`, `curobo.plan_to_grasp_poses`, `curobo.plan_to_pose`, `curobo.plan_with_grasped_object`, `curobo.solve_ik`, `curobo.validate_joint_trajectory_grasped`, `curobo.validate_joint_trajectory_robot` | — |
+| [curve](tools/curve/) | Ordered centrelines of deformable linear objects — skeletonises a cable, rope or hose mask, recovers one traversal order through occlusion breaks and self-crossings (TrackDLO's chain merge), back-projects the ordered pixels through depth onto the object's axis as an arc-length-parameterised polyline, and carries a known centreline onto the next frame with motion imputed for hidden stretches. | `curve.fit_centerline`, `curve.track_centerline` | — |
 | [gemini-er](tools/gemini-er/) | Open-vocabulary 2D object detection via the Gemini Robotics-ER API — one call returns pixel-space bounding boxes with labels and scores for a text query. | `gemini-er.detect` | — |
 | [geometry](tools/geometry/) | Pure-math 3D geometry toolbox — back-project masks and depth to point clouds, DBSCAN-filter noise, fit oriented bounding boxes, derive top-down/front grasp poses, and reconstruct collision worlds from RGB-D frames. | `geometry.build_world_config`, `geometry.cloud_to_attachment`, `geometry.compute_drop_position`, `geometry.compute_feature_mate`, `geometry.compute_obb`, `geometry.compute_xy_distance`, `geometry.depth_to_point_cloud`, `geometry.exclude_robot_points`, `geometry.filter_and_compute_obb`, `geometry.filter_noise`, `geometry.fit_linear_feature`, `geometry.fit_planar_feature`, `geometry.front_grasp_from_obb`, `geometry.iou`, `geometry.mask_to_world_points`, `geometry.pixel_to_world_point`, `geometry.pose_distance`, `geometry.rotate_quat_z90`, `geometry.select_top_down_grasp`, `geometry.top_down_grasp_candidates`, `geometry.top_down_grasp_from_obb`, `geometry.transform_points` | — |
 | [grounding-dino](tools/grounding-dino/) | Grounding DINO zero-shot object detection — natural-language queries to labeled 2D bounding boxes with confidence scores. | `grounding-dino.detect` | — |

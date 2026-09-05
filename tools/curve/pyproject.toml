@@ -1,0 +1,42 @@
+[project]
+name = "curve-tool-bundle"
+version = "0.1.0.dev0"
+description = "Ordered centrelines of deformable linear objects (cable, rope, hose) from a mask and a depth frame, and tracking through occlusion, for gap. Runs out-of-process via gap_core.rpc.server."
+readme = "SKILL.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+  # Tool-server entry point + @tool decorator + types/errors.
+  "graph-as-policy-core",
+  "numpy>=1.26",
+  # splprep/splev (arc-length spline) and linear_sum_assignment (TrackDLO's
+  # chain merge).
+  "scipy>=1.12",
+  # skeletonize — the thinning both the vendored TrackDLO merge and the
+  # principal-axis fallback start from.
+  "scikit-image>=0.22",
+  # cv2 (mask upscale, TrackDLO's contour/mode-filter preprocessing).
+  "opencv-python-headless>=4.9",
+  # PIL (TrackDLO's mode filter).
+  "pillow>=10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# No code ships in the wheel — the bundle is invoked by path (cwd) via
+# `uv run --project tools/curve -- python -m gap_core.rpc.server …`,
+# which imports the in-place `tools.py` directly.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+# Dev-only source override: until graph-as-policy-core is published to PyPI,
+# bundles in the side-by-side open-robot-skills checkout resolve it from the
+# gap workspace's gap-core/ subdir. Drop this block once gap-core is on PyPI.
+[tool.uv.sources]
+graph-as-policy-core = { path = "../../../graph-as-policy/gap-core", editable = true }
