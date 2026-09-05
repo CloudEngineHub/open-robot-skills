@@ -10,7 +10,7 @@ A curated, contributable library of manipulation **skills** and model-backed
 The LLM pipeline composes these bundles into executable robot graphs;
 every bundle is one directory, one `SKILL.md`, one PR.
 
-[![Skills](https://img.shields.io/badge/skills-9-blue.svg)](#skills--what-the-robot-can-do)
+[![Skills](https://img.shields.io/badge/skills-14-blue.svg)](#skills--what-the-robot-can-do)
 [![Tools](https://img.shields.io/badge/tool%20bundles-7-orange.svg)](#tools--what-the-robot-can-compute)
 [![Format: Agent Skills](https://img.shields.io/badge/format-Agent%20Skills-purple.svg)](https://agentskills.io/specification)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing-a-bundle)
@@ -54,6 +54,11 @@ graphs through the policy plane, not the skill registry.
 | [perceiving-object-parts](skills/perceiving-object-parts/) | Hierarchical perception for subpart targeting. | — | `open-robot-skills[perceiving-object-parts]` |
 | [perceiving-objects](skills/perceiving-objects/) | Fast single-path 3D object perception. | — | `open-robot-skills[perceiving-objects]` |
 | [perceiving-objects-oneshot](skills/perceiving-objects-oneshot/) | Lightweight one-shot 3D object perception. | — | `open-robot-skills[perceiving-objects-oneshot]` |
+| [placing-held-feature](skills/placing-held-feature/) | Move a held object so one of its declared features lands on a target point — a ring onto a hook, a tip into a hole, a plug at a bore. | — | `open-robot-skills[placing-held-feature]` |
+| [proposing-short-axis-grasps](skills/proposing-short-axis-grasps/) | Propose top-down grasps whose jaws close ACROSS an elongated object's short axis, derived from its oriented box. | — | `open-robot-skills[proposing-short-axis-grasps]` |
+| [proposing-side-grasps](skills/proposing-side-grasps/) | Propose horizontal (side-entry) grasps swept around an object's oriented box — twelve azimuths ranked by jaw margin. | — | `open-robot-skills[proposing-side-grasps]` |
+| [selecting-reachable-grasp](skills/selecting-reachable-grasp/) | Walk a ranked list of candidate grasp poses and take the first the arm can actually reach — IK solves it, the solution lands where it was asked, and (where `sim.clearance` is available) the arm is clear of the scene there. | — | `open-robot-skills[selecting-reachable-grasp]` |
+| [tipping-over-a-surface-edge](skills/tipping-over-a-surface-edge/) | Turn a body over on the surface it rests on instead of carrying it — pinch two opposite walls LOOSELY and off centre so the pads act as a pin joint, lift so the surface and gravity stand the body up on its own edge, then press it onto the surface and pull the pins toward you about whichever edge is grounded until it is just past balance, and let go. | — | `open-robot-skills[tipping-over-a-surface-edge]` |
 | [tracking-objects](skills/tracking-objects/) | Long-running skill that drives the SAM3 tracker from the graph-scoped observation stream. | `tracking-objects.track` | `open-robot-skills[tracking-objects]` |
 | [transporting-objects](skills/transporting-objects/) | Move the currently-held object to a destination and release. | — | `open-robot-skills[transporting-objects]` |
 

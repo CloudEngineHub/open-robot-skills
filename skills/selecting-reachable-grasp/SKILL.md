@@ -6,8 +6,9 @@ description: Walk a ranked list of candidate grasp poses and take the first the
   Use after any propose rung. This is the fix for taking candidate 0 on faith
   and closing the jaws on nothing.
 compatibility: requires gap>=0.1
-metadata: {category: grasping, tags: [grasping, select, ik, cpu]}
+metadata: {category: grasping, tags: [grasping, select, ik, cpu, sim-only]}
 gap:
+  requires: {connector: [motion.plan_joint, robot.describe_arm, sim.clearance]}
   allowed_tools:
     - robot.solve_ik
     - robot.describe_arm
@@ -16,8 +17,6 @@ gap:
   exit_conditions:
     selected: A pose the arm reaches, with the joint configuration that reaches it.
     none_reachable: No candidate solved. Route to another propose rung.
-  required_inputs:
-    poses: list[Se3Pose]
   hard_rules:
     - >
       A returned IK solution is NOT a solved pose. Backends return their best
@@ -51,6 +50,11 @@ gap:
 ---
 
 # selecting-reachable-grasp
+
+`poses` is a list of `Se3Pose`, best first -- a propose skill's `poses`
+output, or the `poses` field of a `GraspCandidates`. It is declared here in
+prose rather than under `required_inputs` because the registry has no name for
+a bare list of poses, and a `GraspCandidates` is a dict the script does not take.
 
 One strategy for the **select** stage: reachability, then clearance, first
 match wins.

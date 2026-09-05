@@ -35,6 +35,10 @@ dependencies = [
 # are ever needed.
 perceiving-objects = []
 tipping-over-a-surface-edge = []
+placing-held-feature = []
+proposing-short-axis-grasps = []
+proposing-side-grasps = []
+selecting-reachable-grasp = []
 perceiving-objects-oneshot = []
 perceiving-object-parts = []
 perceiving-next-item = []

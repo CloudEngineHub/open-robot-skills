@@ -8,8 +8,9 @@ description: Move a held object so one of its declared features lands on a
   drive the hand to the target directly, which is wrong by the length of the
   held object.
 compatibility: requires gap>=0.1
-metadata: {category: manipulation, tags: [place, feature-mating, geometric, cpu]}
+metadata: {category: manipulation, tags: [place, feature-mating, geometric, cpu, sim-only]}
 gap:
+  requires: {connector: [sim.get_object_pose]}
   allowed_tools:
     - sim.get_object_pose
     - robot.get_ee_pose
