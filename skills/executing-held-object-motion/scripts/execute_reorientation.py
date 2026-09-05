@@ -5,12 +5,18 @@ from typing import Any, TypedDict
 import numpy as np
 from gap import NodeContext
 
+#: Per-waypoint step budget handed to ``robot.execute_trajectory``. A carry
+#: plan is dense, so a waypoint that has not converged in this many control
+#: steps is stuck, not slow; the executor moves on rather than timing out.
+_MAX_STEPS_PER_WAYPOINT = 60
+
 
 class Output(TypedDict):
     final_pose: dict[str, Any]
 
 
 def _time_scale(trajectory: dict[str, Any], scale: float) -> dict[str, Any]:
+    """Resample a joint path so execution duration changes, not its geometry."""
     waypoints = list(trajectory.get("waypoints") or [])
     if scale <= 1.0 or len(waypoints) < 2:
         return trajectory
@@ -44,7 +50,9 @@ def run(ctx: NodeContext, reorientation_plan: dict[str, Any]) -> Output:
         attempts = max(1, min(int(waypoint.get("max_attempts", 1)), 3))
         trajectory = None
         for _ in range(attempts):
-            planner_tool = "motion.plan_linear" if mode == "planned_linear" else "motion.plan_to_pose"
+            planner_tool = (
+                "motion.plan_linear" if mode == "planned_linear" else "motion.plan_to_pose"
+            )
             inputs = (
                 {"end": final_pose, "orientation": "lock"}
                 if mode == "planned_linear"
@@ -63,7 +71,11 @@ def run(ctx: NodeContext, reorientation_plan: dict[str, Any]) -> Output:
                 break
         if not trajectory or not trajectory.get("waypoints"):
             raise RuntimeError(f"collision-aware reorientation failed at waypoint {index} ({mode})")
-        ctx.tool("robot.execute_trajectory", trajectory=_time_scale(trajectory, scale))
+        ctx.tool(
+            "robot.execute_trajectory",
+            trajectory=_time_scale(trajectory, scale),
+            max_steps_per_waypoint=_MAX_STEPS_PER_WAYPOINT,
+        )
 
     assert final_pose is not None
     return {"final_pose": final_pose}

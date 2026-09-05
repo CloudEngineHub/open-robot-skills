@@ -1,6 +1,6 @@
 ---
 name: registering-held-objects
-description: Reobserve a grasped rigid object, estimate its functional feature in the TCP frame, and construct attached collision geometry.
+description: Reobserves a grasped rigid object from the wrist cameras, estimates its functional feature in the TCP frame, and fits attached collision spheres, retaining the grasp-time transform at low confidence when the object is not seen. Use when a held object must be localized in the hand right after grasping or re-checked at a pre-contact pose before a fixture engagement.
 license: Apache-2.0
 compatibility: requires gap>=0.1
 metadata: {category: perception, tags: [in-hand, registration, wrist-camera, collision]}
@@ -9,9 +9,8 @@ gap:
   required_inputs: {reference_cloud: PointCloud, functional_feature: FunctionalFeature, object_description: string}
   produces_outputs: {feature_in_tcp: Se3Pose, object_in_tcp: Se3Pose, attached_object: AttachedObject, registration_confidence: float}
   exit_conditions:
-    registered: A reliable transform was measured.
-    fallback: The grasp-time transform was retained.
-    lost: The object is no longer localized.
+    registered: A feature-in-TCP transform and attachment were produced; registration_confidence is the accepted mask score, or 0.25 when the grasp-time or prior transform was retained.
+    lost: Registration raised — no cloud could be fitted into an attachment or a geometry fit failed, so the object is no longer localized.
   canonical_scripts:
     - register_held: scripts/register_held.py
   streaming: false
@@ -27,11 +26,50 @@ Use immediately after grasping or again at a pre-contact pose. For pre-contact
 realignment, pass the prior feature-in-TCP and attachment: wrist views localize
 the functional feature directly, fit a loop's geometric center and plane rather
 than the centroid of its visible arc, and retain the collision model.
-Grasp-time geometry remains an explicit
-low-confidence fallback.
+Grasp-time geometry remains an explicit low-confidence fallback
+(`registration_confidence == 0.25`); the script does not raise for it, so a
+graph that must stop on a weak registration routes on the confidence.
 
-The default `attachment_fit_type="morphit"` fits 64 collision spheres to a
-watertight convex hull of the observed object and contracts their radii by 2
-mm. This is the standard CuRobo attachment representation for both transport
-and constrained fixture motion. `surface` and `voxel` remain available only
-for explicit fitting experiments; ordinary workflows should keep the default.
+## How the feature is measured
+
+- A loop is segmented from `functional_feature.description` on every pass and
+  its plane and circle centre are fitted. Only the minimum rotation that aligns
+  the prior normal with the fitted normal is applied, so the in-plane roll of
+  the prior (or grasp-time) frame is preserved: a circle has no observable
+  roll and the fit's roll changes between cameras. The coordinate along the
+  normal is the robust midpoint of the observed ring thickness.
+- A tip is segmented from `object_description`. With
+  `direction_marker_description` set (a cap, a coloured band, a head) and both
+  masks visible in the same wrist view, the tip is re-derived as the endpoint
+  of the object's principal axis directed toward the marker; with a prior, the
+  prior roll about that axis is preserved. Without a marker the cloud median is
+  compared with the predicted feature centre.
+- With a prior, an observed centre more than 4 cm from the prediction is a
+  mask on the gripper or background and is rejected (confidence 0.25).
+- On the first pass for non-loop features, an observed cloud whose 3D extent
+  is outside 0.55--1.80 of the reference cloud's extent is rejected before it
+  becomes an enormous attachment or clearance waypoint (confidence 0.25).
+
+## Grasp transform and attachment
+
+- `grasp_pose` (optional) is the commanded grasp TCP pose. When given, the
+  reference cloud and the pre-grasp feature pose are carried by the rigid
+  transform current-TCP · inv(grasp_pose), so the fallback feature-in-hand is
+  inv(grasp_pose) · feature_world rather than inv(current TCP) · feature_world.
+  Pass it whenever registration happens after a lift or a verification move.
+- `attachment_source` selects the cloud that bounds the collision model when
+  no `prior_attached_object` is given: `"reference"` (default) fits the
+  complete pre-grasp cloud, carried as above; `"observed"` fits the accepted
+  wrist cloud, falling back to the carried reference cloud when the wrist saw
+  nothing usable. `object_in_tcp` is centred on the same cloud.
+- The attachment is `geometry.cloud_to_attachment(fit_type=attachment_fit_type,
+  surface_radius=0.002, margin=0.002, max_spheres=64)`: 64 MORPHIT spheres on
+  a watertight convex hull, radii contracted by 2 mm. `surface` and `voxel`
+  remain available for explicit fitting experiments only.
+- `camera_name_filter` (default `"eye_in_hand"`) is a substring the camera
+  name must contain; set it to another camera name when a held object is
+  better observed from an overview camera.
+
+Object-specific refinement (CAD registration, per-object landmarks) is not
+part of this skill; a graph performs it in its own node and passes the result
+as `prior_feature_in_tcp` / `prior_object_in_tcp`.

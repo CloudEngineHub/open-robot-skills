@@ -30,10 +30,12 @@ def _specific_container_box(
     detections: list[dict[str, Any]], image_shape: tuple[int, ...]
 ) -> dict[str, Any]:
     """Prefer the tight destination container over a higher-scoring parent scene box."""
+    # The detector often returns a compact box around the four printed labels
+    # as well as an oversized "destination bin" box spanning both source and
+    # target. The former is the reliable footprint of this labelled 2x2
+    # container.
     image_height, image_width = image_shape[:2]
-    # Relative thresholds remain valid when camera resolution changes.  These
-    # deliberately accept a smaller apparent container than the old 150x130
-    # gate (about 115x96 in a 640x480 image).
+    # Smaller, resolution-independent gates: about 115x96 for 640x480.
     label_min_width = 0.18 * image_width
     label_min_height = 0.20 * image_height
     label_groups = []
@@ -87,7 +89,9 @@ def _read_labels(ctx: NodeContext, image: Any, layout_description: str) -> dict[
     return found
 
 
-def _region_obb(ctx: NodeContext, camera: dict[str, Any], bounds: dict[str, Any], position: str) -> dict[str, Any]:
+def _region_obb(
+    ctx: NodeContext, camera: dict[str, Any], bounds: dict[str, Any], position: str
+) -> dict[str, Any]:
     x1, y1, x2, y2 = (int(round(float(bounds[key]))) for key in ("x1", "y1", "x2", "y2"))
     inset_x = max(3, int(0.08 * (x2 - x1)))
     inset_y = max(3, int(0.08 * (y2 - y1)))
@@ -96,7 +100,7 @@ def _region_obb(ctx: NodeContext, camera: dict[str, Any], bounds: dict[str, Any]
     xa, xb = (x1 + inset_x, middle_x - inset_x) if left else (middle_x + inset_x, x2 - inset_x)
     ya, yb = (y1 + inset_y, middle_y - inset_y) if top else (middle_y + inset_y, y2 - inset_y)
     mask = np.zeros(np.asarray(camera["depth"]).shape[:2], dtype=np.uint8)
-    mask[max(0, ya):max(0, yb), max(0, xa):max(0, xb)] = 255
+    mask[max(0, ya) : max(0, yb), max(0, xa) : max(0, xb)] = 255
     cloud = ctx.tool(
         "geometry.mask_to_world_points",
         mask=mask,
@@ -113,10 +117,11 @@ def _region_obb(ctx: NodeContext, camera: dict[str, Any], bounds: dict[str, Any]
     if len(floor) < 10:
         floor = points
     low, high = np.quantile(floor, [0.10, 0.90], axis=0)
-    center, extent = 0.5 * (low + high), np.maximum(0.5 * (high - low), [0.025, 0.025, 0.002])
+    center = 0.5 * (low + high)
+    extent = np.maximum(0.5 * (high - low), [0.025, 0.025, 0.002])
     return {
-        "center": dict(zip(("x", "y", "z"), map(float, center))),
-        "extent": dict(zip(("x", "y", "z"), map(float, extent))),
+        "center": dict(zip(("x", "y", "z"), map(float, center), strict=True)),
+        "extent": dict(zip(("x", "y", "z"), map(float, extent), strict=True)),
         "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
     }
 
@@ -130,14 +135,21 @@ def run(
     camera = _camera(observation, camera_name)
     image = camera["rgb"]
     labels = _read_labels(ctx, image, layout_description)
-    detections = ctx.tool(
-        "grounding-dino.detect", image=image, query=layout_description, box_threshold=0.10,
-    ).get("detections") or []
+    detections = (
+        ctx.tool(
+            "grounding-dino.detect", image=image, query=layout_description, box_threshold=0.10
+        ).get("detections")
+        or []
+    )
     if not detections:
         raise ValueError(f"could not localize {layout_description!r}")
     bounds = _specific_container_box(detections, np.asarray(image).shape)
     regions = [
-        {"label": label, "image_position": position, "obb": _region_obb(ctx, camera, bounds, position)}
+        {
+            "label": label,
+            "image_position": position,
+            "obb": _region_obb(ctx, camera, bounds, position),
+        }
         for position, label in labels.items()
     ]
     return {"layout_json": json.dumps(regions)}
