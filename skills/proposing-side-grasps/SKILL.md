@@ -6,8 +6,9 @@ description: Propose horizontal (side-entry) grasps swept around an object's
   vertical dimension is the only one the hand can span. Declines when the
   object is wider than the jaws from every azimuth.
 compatibility: requires gap>=0.1
-metadata: {category: grasping, tags: [grasping, propose, geometric, cpu]}
+metadata: {category: grasping, tags: [grasping, propose, geometric, cpu, sim-only]}
 gap:
+  requires: {connector: [sim.get_object_obb, robot.describe_gripper, robot.grasp_frame]}
   allowed_tools:
     - sim.get_object_obb
     - robot.describe_gripper

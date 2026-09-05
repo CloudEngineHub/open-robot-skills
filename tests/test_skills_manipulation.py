@@ -7,14 +7,19 @@ GPU, no LLM. The assertions pin the behaviors the source bundles tuned:
 - grasping-with-planner: full open → … → close call sequence, the planner
   kwargs (cad=0.005, ignore_obstacle_names, use_grasp_approach=False), and
   the PlanningFailed failure path;
-- grasping-direct-ik: the align-then-descend pose progression (OBB top +
-  0.15 m clearance, rotation preserved);
+- grasping-direct-ik: the align-then-descend pose progression (clearance
+  pinned or asked of robot.describe_workspace, measured from the higher of
+  OBB top and grasp), and the close-axis grasp refinement through
+  robot.describe_gripper / robot.grasp_frame with its fingertip floor;
 - grasping-short-axis: short-axis orientation math on an elongated OBB,
   the thin-bar Z clamp, and the base-offset slide;
-- transporting-objects: drop-pose Z math (panda_hand_to_tcp=0.1029,
-  margin=max(0.03, clearance)), yaw-only drop rotation, the
-  lift-translate waypoint plan at z=0.45, and descend/release/retract
-  sequencing;
+- transporting-objects: drop-pose Z math (wrist-to-TCP from
+  robot.describe_arm's tcp_offset on the hand's approach axis,
+  margin=max(0.03, clearance)), yaw-only drop rotation composed by
+  robot.grasp_frame, the lift-translate waypoint plan at the workspace's
+  transport_z with its reach-limit descent ladder, container-derived
+  transport/hover heights with the reached-pose gate and the planned-leg
+  fallback, and descend/release/retract sequencing;
 - tracking-objects: tracker_init exactly once per session (statefulness
   across run() visits), per-tick ctx.publish snapshots, tracker_close in
   the finally;
@@ -33,8 +38,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from gap_core.errors import PlanningFailed
 from gap.testing import FakeContext
+from gap_core.errors import PlanningFailed
 from scipy.spatial.transform import Rotation
 
 MANIPULATION_BUNDLES = (
@@ -81,27 +86,29 @@ def _obb(center, extent, quat=(1.0, 0.0, 0.0, 0.0)):
 
 def _trajectory(n=3, dof=7):
     return {
-        "waypoints": [
-            {"positions": np.full(dof, float(i), dtype=np.float64)} for i in range(n)
-        ]
+        "waypoints": [{"positions": np.full(dof, float(i), dtype=np.float64)} for i in range(n)]
     }
 
 
 def _observation(ee_z=0.30):
     rgb = np.zeros((8, 8, 3), dtype=np.uint8)
     return {
-        "cameras": [{
-            "name": "agentview",
-            "rgb": rgb,
-            "depth": np.ones((8, 8), dtype=np.float32),
-            "intrinsics": np.eye(3),
-            "pose": _pose(0.0, -0.7, 0.9),
-        }],
-        "arms": [{
-            "joint_state": {"positions": np.zeros(7, dtype=np.float64)},
-            "gripper_fraction": 1.0,
-            "ee_pose": _pose(0.3, 0.0, ee_z),
-        }],
+        "cameras": [
+            {
+                "name": "agentview",
+                "rgb": rgb,
+                "depth": np.ones((8, 8), dtype=np.float32),
+                "intrinsics": np.eye(3),
+                "pose": _pose(0.0, -0.7, 0.9),
+            }
+        ],
+        "arms": [
+            {
+                "joint_state": {"positions": np.zeros(7, dtype=np.float64)},
+                "gripper_fraction": 1.0,
+                "ee_pose": _pose(0.3, 0.0, ee_z),
+            }
+        ],
     }
 
 
@@ -134,9 +141,7 @@ def test_all_manipulation_bundles_discover(skills_registry):
         assert info.kind == "policy"
         assert info.namespace == "policies"
         assert info.meta.description
-        assert info.meta.serving is not None, (
-            f"{bundle}: policy bundle has no gap.serving: block"
-        )
+        assert info.meta.serving is not None, f"{bundle}: policy bundle has no gap.serving: block"
 
 
 def test_allowed_tools_are_known_names(skills_registry):
@@ -145,7 +150,10 @@ def test_allowed_tools_are_known_names(skills_registry):
     known = known_tool_names([info.meta for info in skills_registry.list_skills()])
     for bundle in (*MANIPULATION_BUNDLES, *POLICY_BUNDLES):
         info = skills_registry.get(bundle)
-        unknown = set(info.meta.allowed_tools) - known
+        # A richer connector's tools count as resolvable once the bundle
+        # declares them under gap.requires.connector (the checker's rule).
+        declared = set(info.meta.requires.connector) if info.meta.requires else set()
+        unknown = set(info.meta.allowed_tools) - known - declared
         assert not unknown, f"{bundle}: unknown allowed_tools {sorted(unknown)}"
 
 
@@ -180,25 +188,33 @@ class TestGraspingWithPlanner:
     TARGET_OBB = _obb((0.4, 0.1, 0.05), (0.04, 0.03, 0.05))
 
     def _happy_ctx(self, traj):
-        return FakeContext({
-            "robot.open_gripper": {"position": 1.0},
-            "geometry.top_down_grasp_candidates": {
-                "candidates": {"poses": [
-                    _pose(0.4, 0.1, 0.06), _pose(0.4, 0.1, 0.06, (0.0, 0.0, 1.0, 0.0)),
-                ]}
-            },
-            "robot.get_ee_pose": {"pose": _pose(0.3, 0.0, 0.3)},
-            "robot.go_to_pose": None,
-            "robot.get_observation": _observation(),
-            "geometry.build_world_config": {
-                "config": {"meshes": []}, "mesh_names": ["scene", "target"],
-            },
-            "curobo.plan_to_grasp_poses": {
-                "success": True, "trajectory": traj, "goalset_index": 0,
-            },
-            "robot.execute_trajectory": None,
-            "robot.close_gripper": {"position": 0.21},
-        })
+        return FakeContext(
+            {
+                "robot.open_gripper": {"position": 1.0},
+                "geometry.top_down_grasp_candidates": {
+                    "candidates": {
+                        "poses": [
+                            _pose(0.4, 0.1, 0.06),
+                            _pose(0.4, 0.1, 0.06, (0.0, 0.0, 1.0, 0.0)),
+                        ]
+                    }
+                },
+                "robot.get_ee_pose": {"pose": _pose(0.3, 0.0, 0.3)},
+                "robot.go_to_pose": None,
+                "robot.get_observation": _observation(),
+                "geometry.build_world_config": {
+                    "config": {"meshes": []},
+                    "mesh_names": ["scene", "target"],
+                },
+                "curobo.plan_to_grasp_poses": {
+                    "success": True,
+                    "trajectory": traj,
+                    "goalset_index": 0,
+                },
+                "robot.execute_trajectory": None,
+                "robot.close_gripper": {"position": 0.21},
+            }
+        )
 
     def test_happy_path_call_sequence(self, skills_registry):
         traj = _trajectory()
@@ -220,13 +236,18 @@ class TestGraspingWithPlanner:
         assert out == {"done": True}
         obs = ctx.tool("robot.get_observation")
         world = build_world.run(
-            ctx, observation=obs,
+            ctx,
+            observation=obs,
             target_mask=np.full((8, 8), 255, dtype=np.uint8),
-            target_obb=self.TARGET_OBB, target_name="target",
+            target_obb=self.TARGET_OBB,
+            target_name="target",
         )
         plan = plan_grasp.run(
-            ctx, world_config=world["config"], observation=obs,
-            grasp_poses=poses, target_name="target",
+            ctx,
+            world_config=world["config"],
+            observation=obs,
+            grasp_poses=poses,
+            target_name="target",
         )
         assert plan["trajectory"] is traj
         ctx.tool("robot.execute_trajectory", trajectory=plan["trajectory"])
@@ -263,24 +284,29 @@ class TestGraspingWithPlanner:
         assert order.index("curobo.plan_to_grasp_poses") > order.index(
             "geometry.build_world_config"
         )
-        assert order.index("robot.execute_trajectory") > order.index(
-            "curobo.plan_to_grasp_poses"
-        )
+        assert order.index("robot.execute_trajectory") > order.index("curobo.plan_to_grasp_poses")
         assert order[-1] == "robot.close_gripper"
         assert ctx.calls_to("robot.close_gripper")[0].kwargs["settle_steps"] == 60
         assert ctx.calls_to("robot.execute_trajectory")[0].kwargs["trajectory"] is traj
 
     def test_planning_failure_raises(self, skills_registry):
         plan_grasp = _script(skills_registry, "grasping-with-planner", "plan_grasp")
-        ctx = FakeContext({
-            "curobo.plan_to_grasp_poses": {
-                "success": False, "trajectory": None, "goalset_index": 0,
-            },
-        })
+        ctx = FakeContext(
+            {
+                "curobo.plan_to_grasp_poses": {
+                    "success": False,
+                    "trajectory": None,
+                    "goalset_index": 0,
+                },
+            }
+        )
         with pytest.raises(PlanningFailed):
             plan_grasp.run(
-                ctx, world_config={"meshes": []}, observation=_observation(),
-                grasp_poses=[_pose(0.4, 0.1, 0.06)], target_name="target",
+                ctx,
+                world_config={"meshes": []},
+                observation=_observation(),
+                grasp_poses=[_pose(0.4, 0.1, 0.06)],
+                target_name="target",
             )
         # Failure happens before any execution.
         assert ctx.call_count("robot.execute_trajectory") == 0
@@ -288,14 +314,21 @@ class TestGraspingWithPlanner:
     def test_plan_grasp_autowraps_bare_pose(self, skills_registry):
         plan_grasp = _script(skills_registry, "grasping-with-planner", "plan_grasp")
         traj = _trajectory()
-        ctx = FakeContext({
-            "curobo.plan_to_grasp_poses": {
-                "success": True, "trajectory": traj, "goalset_index": 0,
-            },
-        })
+        ctx = FakeContext(
+            {
+                "curobo.plan_to_grasp_poses": {
+                    "success": True,
+                    "trajectory": traj,
+                    "goalset_index": 0,
+                },
+            }
+        )
         plan_grasp.run(
-            ctx, world_config={"meshes": []}, observation=_observation(),
-            grasp_poses=_pose(0.4, 0.1, 0.06), target_name="target",
+            ctx,
+            world_config={"meshes": []},
+            observation=_observation(),
+            grasp_poses=_pose(0.4, 0.1, 0.06),
+            target_name="target",
         )
         sent = ctx.calls_to("curobo.plan_to_grasp_poses")[0].kwargs["grasp_poses"]
         assert isinstance(sent, list) and len(sent) == 1
@@ -307,23 +340,24 @@ class TestGraspingWithPlanner:
 
 
 class TestGraspingDirectIk:
-    def test_descend_sequence_pose_progression(self, skills_registry):
-        compute_align = _script(
-            skills_registry, "grasping-direct-ik", "compute_align_pose"
-        )
-        target_obb = _obb((0.4, 0.1, 0.05), (0.04, 0.03, 0.06))
+    # Top face at 0.11, support (bottom face) at -0.01.
+    OBB = _obb((0.4, 0.1, 0.05), (0.04, 0.03, 0.06))
+
+    def test_pinned_clearance_keeps_the_numbers_and_makes_no_tool_call(self, skills_registry):
+        compute_align = _script(skills_registry, "grasping-direct-ik", "compute_align_pose")
         grasp_pose = _pose(0.41, 0.12, 0.07, (0.0, 0.96, 0.0, 0.28))
 
         ctx = FakeContext({"robot.go_to_pose": None})
-        out = compute_align.run(ctx, grasp_pose=grasp_pose, target_obb=target_obb)
+        out = compute_align.run(ctx, grasp_pose=grasp_pose, target_obb=self.OBB, clearance=0.15)
         align = out["align_pose"]
 
-        # Align pose: same XY + rotation as the grasp, Z = OBB top + 0.15.
+        # Align pose: same XY + rotation as the grasp, Z = OBB top + 0.15 (the
+        # grasp sits inside the box, so the top face is the reference).
         assert align["position"]["x"] == pytest.approx(0.41)
         assert align["position"]["y"] == pytest.approx(0.12)
         assert align["position"]["z"] == pytest.approx(0.05 + 0.06 + 0.15)
         assert align["rotation"] == grasp_pose["rotation"]
-        # The script is pure math: no tool calls.
+        # A pinned clearance is pure math: no tool calls.
         assert ctx.calls == []
 
         # rotate_align then descend — straight-down progression with the
@@ -339,14 +373,119 @@ class TestGraspingDirectIk:
         assert first["position"]["z"] > second["position"]["z"]
         assert second["position"]["z"] == pytest.approx(0.07)
 
+    def test_zero_clearance_asks_the_workspace(self, skills_registry):
+        compute_align = _script(skills_registry, "grasping-direct-ik", "compute_align_pose")
+        ctx = FakeContext({"robot.describe_workspace": {"align_clearance_m": 0.123}})
+        out = compute_align.run(ctx, grasp_pose=_pose(0.41, 0.12, 0.07), target_obb=self.OBB)
+        # The hand's own envelope above the fingertips, not a literal.
+        assert out["align_pose"]["position"]["z"] == pytest.approx(0.11 + 0.123)
+        assert [c.tool for c in ctx.calls] == ["robot.describe_workspace"]
+
+    def test_a_grasp_above_the_obb_top_takes_the_max_branch(self, skills_registry):
+        compute_align = _script(skills_registry, "grasping-direct-ik", "compute_align_pose")
+        # A thin object whose grasp was clamped to a fingertip floor 3 cm
+        # above its top face: the hover stands the full clearance above the
+        # fingers, not above the box — max(grasp_z, top) + clearance.
+        grasp_pose = _pose(0.41, 0.12, 0.14)
+        out = compute_align.run(
+            FakeContext({}), grasp_pose=grasp_pose, target_obb=self.OBB, clearance=0.12
+        )
+        assert out["align_pose"]["position"]["z"] == pytest.approx(0.14 + 0.12)
+
+    # -- refine_top_down_grasp -------------------------------------------------
+
+    # A bar lying along x on a table at z=0: its short horizontal axis is y.
+    BAR = _obb((0.4, 0.1, 0.01), (0.10, 0.02, 0.01))
+    FRAME = _quat(0.0, 0.7071, 0.7071, 0.0)
+
+    @staticmethod
+    def _gripper(stated=True):
+        return {
+            "finger": {"stated": stated, "reach_m": 0.045, "clearance_m": 0.004},
+            "approach_axis": _vec3(0.0, 0.0, 1.0),
+            "close_axis": _vec3(0.0, 1.0, 0.0),
+        }
+
+    def test_refine_closes_across_the_short_axis_and_lifts_to_the_fingertip_floor(
+        self, skills_registry
+    ):
+        refine = _script(skills_registry, "grasping-direct-ik", "refine_top_down_grasp")
+        ctx = FakeContext(
+            {
+                "robot.describe_gripper": self._gripper(),
+                "robot.grasp_frame": {"rotation": self.FRAME},
+            }
+        )
+        out = refine.run(ctx, grasp_pose=_pose(0.4, 0.1, 0.01), target_obb=self.BAR)
+        # The jaws close along world y (heading 90 deg), approaching straight
+        # down; the connector composes the frame for this hand's axes.
+        frame_call = ctx.calls_to("robot.grasp_frame")[0]
+        assert frame_call.kwargs["close_heading_deg"] == pytest.approx(90.0)
+        assert frame_call.kwargs["approach"] == {"x": 0.0, "y": 0.0, "z": -1.0}
+        refined = out["grasp_pose"]
+        assert refined["rotation"] == self.FRAME
+        # Fingertip floor: support 0.0 + reach 0.045 + clearance 0.004.
+        assert refined["position"]["z"] == pytest.approx(0.049)
+        assert refined["position"]["x"] == pytest.approx(0.4)
+        assert refined["position"]["y"] == pytest.approx(0.1)
+        assert [c.tool for c in ctx.calls] == ["robot.describe_gripper", "robot.grasp_frame"]
+
+    def test_refine_follows_a_rotated_bar(self, skills_registry):
+        refine = _script(skills_registry, "grasping-direct-ik", "refine_top_down_grasp")
+        q = Rotation.from_euler("z", np.radians(30.0)).as_quat()  # xyzw
+        bar = _obb((0.4, 0.1, 0.01), (0.10, 0.02, 0.01), (q[3], q[0], q[1], q[2]))
+        ctx = FakeContext(
+            {
+                "robot.describe_gripper": self._gripper(),
+                "robot.grasp_frame": {"rotation": self.FRAME},
+            }
+        )
+        refine.run(ctx, grasp_pose=_pose(0.4, 0.1, 0.10), target_obb=bar)
+        # Short axis y turned by 30 deg -> heading 120 deg.
+        heading = ctx.calls_to("robot.grasp_frame")[0].kwargs["close_heading_deg"]
+        assert heading == pytest.approx(120.0)
+
+    def test_refine_leaves_z_when_the_hand_states_no_finger_envelope(self, skills_registry):
+        refine = _script(skills_registry, "grasping-direct-ik", "refine_top_down_grasp")
+        ctx = FakeContext(
+            {
+                "robot.describe_gripper": self._gripper(stated=False),
+                "robot.grasp_frame": {"rotation": self.FRAME},
+            }
+        )
+        out = refine.run(ctx, grasp_pose=_pose(0.4, 0.1, 0.01), target_obb=self.BAR)
+        assert out["grasp_pose"]["position"]["z"] == pytest.approx(0.01)
+
+    def test_refine_then_align_reproduces_the_pinned_hover(self, skills_registry):
+        refine = _script(skills_registry, "grasping-direct-ik", "refine_top_down_grasp")
+        compute_align = _script(skills_registry, "grasping-direct-ik", "compute_align_pose")
+        ctx = FakeContext(
+            {
+                "robot.describe_gripper": self._gripper(),
+                "robot.grasp_frame": {"rotation": self.FRAME},
+            }
+        )
+        refined = refine.run(ctx, grasp_pose=_pose(0.4, 0.1, 0.01), target_obb=self.BAR)
+        out = compute_align.run(
+            FakeContext({}), grasp_pose=refined["grasp_pose"], target_obb=self.BAR, clearance=0.12
+        )
+        # The refined grasp (0.049) stands above the bar's top (0.02), so the
+        # hover is max(0.049 + 0.12, 0.02 + 0.12) at the refined rotation.
+        assert out["align_pose"]["position"]["z"] == pytest.approx(0.049 + 0.12)
+        assert out["align_pose"]["rotation"] == self.FRAME
+
     def test_plan_to_pose_failure_raises(self, skills_registry):
         plan_to_pose = _script(skills_registry, "grasping-direct-ik", "plan_to_pose")
-        ctx = FakeContext({
-            "curobo.plan_to_pose": {"success": False, "trajectory": None},
-        })
+        ctx = FakeContext(
+            {
+                "curobo.plan_to_pose": {"success": False, "trajectory": None},
+            }
+        )
         with pytest.raises(PlanningFailed):
             plan_to_pose.run(
-                ctx, world_config={"meshes": []}, observation=_observation(),
+                ctx,
+                world_config={"meshes": []},
+                observation=_observation(),
                 target_pose=_pose(0.4, 0.1, 0.2),
             )
 
@@ -403,7 +542,10 @@ class TestGraspingShortAxis:
         base = _obb((0.2, 0.1, 0.05), (0.10, 0.10, 0.04))
         grasp = _pose(0.4, 0.1, 0.05)
         out = offset.run(
-            FakeContext({}), handle_obb=handle, grasp_pose=grasp, base_obb=base,
+            FakeContext({}),
+            handle_obb=handle,
+            grasp_pose=grasp,
+            base_obb=base,
         )
         adj = out["adjusted_grasp"]
         # Slide along +X (base→handle) by 0.3 * long half-extent (0.10).
@@ -420,31 +562,35 @@ class TestGraspingShortAxis:
         assert out["adjusted_grasp"] is grasp
 
     def test_finalize_trajectory_converges_last_waypoint(self, skills_registry):
-        finalize = _script(
-            skills_registry, "grasping-short-axis", "finalize_trajectory"
-        )
+        finalize = _script(skills_registry, "grasping-short-axis", "finalize_trajectory")
         traj = _trajectory(n=4)
         ctx = FakeContext({"robot.move_to_joints": None})
         out = finalize.run(ctx, trajectory=traj)
         assert out == {"done": True}
         mtj = ctx.calls_to("robot.move_to_joints")[0].kwargs
-        assert mtj["joint_config"]["positions"] == list(
-            traj["waypoints"][-1]["positions"]
-        )
+        assert mtj["joint_config"]["positions"] == list(traj["waypoints"][-1]["positions"])
         assert mtj["max_steps"] == 120  # full convergence before close
 
     def test_per_pose_plan_retry_then_failure(self, skills_registry):
         plan_grasp = _script(skills_registry, "grasping-short-axis", "plan_grasp")
-        ctx = FakeContext({
-            "curobo.plan_to_grasp_poses": {
-                "success": False, "trajectory": None, "goalset_index": 0,
-            },
-        })
+        ctx = FakeContext(
+            {
+                "curobo.plan_to_grasp_poses": {
+                    "success": False,
+                    "trajectory": None,
+                    "goalset_index": 0,
+                },
+            }
+        )
         poses = [_pose(0.4, 0.1, 0.05), _pose(0.4, 0.1, 0.05, (0, 0, 1, 0))]
         with pytest.raises(PlanningFailed):
             plan_grasp.run(
-                ctx, world_config={"meshes": []}, observation=_observation(),
-                grasp_poses=poses, target_name="target", retries=2,
+                ctx,
+                world_config={"meshes": []},
+                observation=_observation(),
+                grasp_poses=poses,
+                target_name="target",
+                retries=2,
             )
         # Per-pose loop: 2 candidates x 2 retries, each a singleton goalset.
         calls = ctx.calls_to("curobo.plan_to_grasp_poses")
@@ -460,12 +606,36 @@ class TestGraspingShortAxis:
 class TestTransportingObjects:
     CONTAINER = _obb((0.5, -0.2, 0.05), (0.10, 0.10, 0.05))
     HELD = _obb((0.4, 0.1, 0.03), (0.03, 0.03, 0.03))
+    # What the connector says about a hand whose TCP sits 0.1029 m along its
+    # approach axis (tool-local +z) and whose jaws close along tool-local x.
+    ARM = {"arm_id": 0, "tcp_offset": _vec3(0.0, 0.0, 0.1029)}
+    GRIPPER = {"approach_axis": _vec3(0.0, 0.0, 1.0), "close_axis": _vec3(1.0, 0.0, 0.0)}
+    WORKSPACE = {"transport_z": 0.45, "surface_z": 0.0, "align_clearance_m": 0.15}
+    WRIST = _quat(0.0, 0.96, 0.0, 0.28)
+
+    @staticmethod
+    def _grasp_frame(approach=None, close_heading_deg=None, **_):
+        """That hand's top-down grasp frame at a world heading: R_z(h) · R_x(pi)."""
+        yaw = np.radians(close_heading_deg or 0.0)
+        q = (Rotation.from_euler("z", yaw) * Rotation.from_euler("x", np.pi)).as_quat()
+        return {"rotation": _quat(q[3], q[0], q[1], q[2])}
+
+    def _hand_cans(self):
+        return {
+            "robot.describe_arm": self.ARM,
+            "robot.describe_gripper": self.GRIPPER,
+            "robot.describe_workspace": self.WORKSPACE,
+            "robot.grasp_frame": self._grasp_frame,
+        }
+
+    # -- compute_drop_pose --------------------------------------------------------
 
     def test_compute_drop_pose_z_math(self, skills_registry):
         compute = _script(skills_registry, "transporting-objects", "compute_drop_pose")
         ee_at_grasp = _pose(0.4, 0.1, 0.15)  # top-down, yaw 0
+        ctx = FakeContext({**self._hand_cans(), "robot.get_ee_pose": {"pose": ee_at_grasp}})
         out = compute.run(
-            FakeContext({"robot.get_ee_pose": {"pose": ee_at_grasp}}),
+            ctx,
             container_obb=self.CONTAINER,
             held_obb=self.HELD,
             ee_pose_at_grasp=ee_at_grasp,
@@ -473,17 +643,23 @@ class TestTransportingObjects:
         # container top = 0.10; margin = max(0.03, 0.05) = 0.05;
         # desired_obj_z = 0.10 + 0.05 + 0.03 = 0.18 (< ceiling 0.199);
         # ee_to_obj = live ee z 0.15 - 0.03 = 0.12 -> ee_z_at_drop = 0.30;
-        # tcp = 0.30 - 0.1029 (panda hand->tcp). The at-grasp ee height is
-        # measured LIVE (robot.get_ee_pose) — the wired ee_pose_at_grasp
-        # is the yaw source and the fallback only.
+        # tcp = 0.30 - 0.1029, the wrist-to-TCP distance being the arm's
+        # tcp_offset projected on the hand's approach axis (robot.describe_arm
+        # / robot.describe_gripper), not a literal. The at-grasp ee height is
+        # measured LIVE (robot.get_ee_pose) — the wired ee_pose_at_grasp is
+        # the yaw source and the fallback only.
         assert out["drop_position"]["x"] == pytest.approx(0.5)
         assert out["drop_position"]["y"] == pytest.approx(-0.2)
         assert out["drop_position"]["z"] == pytest.approx(0.30 - 0.1029)
         assert out["approach_pose"]["position"]["z"] == pytest.approx(
             out["drop_position"]["z"] + 0.20
         )
-        # Yaw-only drop rotation: grasp was yaw-0 top-down, so the drop
-        # rotation is the canonical top-down quat (up to sign).
+        assert ctx.call_count("robot.describe_arm") == 1
+        # Yaw-only drop rotation: grasp was yaw-0 top-down, so the frame is
+        # asked of the hand at heading 0 and is the canonical top-down.
+        assert ctx.calls_to("robot.grasp_frame")[0].kwargs["close_heading_deg"] == pytest.approx(
+            0.0
+        )
         R = _quat_to_matrix(out["drop_pose"]["rotation"])
         assert R == pytest.approx(np.diag([1.0, -1.0, -1.0]), abs=1e-9)
 
@@ -498,23 +674,46 @@ class TestTransportingObjects:
             "position": _vec3(0.4, 0.1, 0.15),
             "rotation": _quat(R_grasp[3], R_grasp[0], R_grasp[1], R_grasp[2]),
         }
+        ctx = FakeContext({**self._hand_cans(), "robot.get_ee_pose": {"pose": ee_at_grasp}})
         out = compute.run(
-            FakeContext({"robot.get_ee_pose": {"pose": ee_at_grasp}}),
+            ctx,
             container_obb=self.CONTAINER,
             held_obb=self.HELD,
             ee_pose_at_grasp=ee_at_grasp,
         )
+        # The heading is measured along the axis the hand says it closes on
+        # and handed to robot.grasp_frame rather than composed by hand.
+        heading = ctx.calls_to("robot.grasp_frame")[0].kwargs["close_heading_deg"]
+        assert heading == pytest.approx(45.0)
         R_drop = _quat_to_matrix(out["drop_pose"]["rotation"])
         # Still top-down (gripper Z down)...
         assert R_drop[:, 2] == pytest.approx([0.0, 0.0, -1.0], abs=1e-9)
         # ...with the grasp-time yaw preserved on the X axis.
         assert np.arctan2(R_drop[1, 0], R_drop[0, 0]) == pytest.approx(yaw)
 
+    def test_compute_drop_pose_pinned_wrist_to_tcp_skips_the_arm(self, skills_registry):
+        compute = _script(skills_registry, "transporting-objects", "compute_drop_pose")
+        ee_at_grasp = _pose(0.4, 0.1, 0.15)
+        ctx = FakeContext({**self._hand_cans(), "robot.get_ee_pose": {"pose": ee_at_grasp}})
+        out = compute.run(
+            ctx,
+            container_obb=self.CONTAINER,
+            held_obb=self.HELD,
+            ee_pose_at_grasp=ee_at_grasp,
+            wrist_to_tcp=0.0,
+        )
+        assert out["drop_position"]["z"] == pytest.approx(0.30)
+        assert ctx.call_count("robot.describe_arm") == 0
+
     def test_compute_drop_pose_no_held_geometry_fallback(self, skills_registry):
         compute = _script(skills_registry, "transporting-objects", "compute_drop_pose")
-        out = compute.run(FakeContext({}), container_obb=self.CONTAINER)
+        # No live ee pose scripted: the read fails and is caught.
+        ctx = FakeContext(self._hand_cans())
+        out = compute.run(ctx, container_obb=self.CONTAINER)
         # Legacy contract: TCP just above the rim by drop_clearance.
         assert out["drop_position"]["z"] == pytest.approx(0.10 + 0.05)
+        # No grasp yaw to preserve: the hand's plain top-down frame.
+        assert ctx.calls_to("robot.grasp_frame")[0].kwargs == {}
 
     def test_drop_offset_identity_when_parent_equals_held(self, skills_registry):
         drop_offset = _script(skills_registry, "transporting-objects", "drop_offset_pose")
@@ -547,17 +746,36 @@ class TestTransportingObjects:
         assert out["drop_position"]["y"] == pytest.approx(-0.2)
         assert out["drop_position"]["z"] == pytest.approx(0.2)
 
+    # -- waypoint_move --------------------------------------------------------------
+
+    def _waypoint_ctx(self, cartesian=None, workspace=None):
+        return FakeContext(
+            {
+                "robot.get_observation": _observation(),
+                "robot.describe_arm": self.ARM,
+                "robot.describe_workspace": workspace or self.WORKSPACE,
+                "robot.grasp_frame": self._grasp_frame,
+                "robot.go_to_pose_cartesian": cartesian,
+            }
+        )
+
+    @staticmethod
+    def _lateral_heights(ctx):
+        return [
+            c.kwargs["pose"]["position"]["z"]
+            for c in ctx.calls_to("robot.go_to_pose_cartesian")[1:]
+        ]
+
     def test_waypoint_move_two_cartesian_legs(self, skills_registry):
         waypoint = _script(skills_registry, "transporting-objects", "waypoint_move")
-        ctx = FakeContext({
-            "robot.get_observation": _observation(),
-            "robot.go_to_pose_cartesian": None,
-        })
+        ctx = self._waypoint_ctx()
         out = waypoint.run(ctx, drop_x=0.5, drop_y=-0.2)
-        assert out == {"done": True}
+        assert out["done"] is True
+        assert out["flown_z"] == pytest.approx(0.45)
+        assert out["descents"] == 0
         legs = ctx.calls_to("robot.go_to_pose_cartesian")
         assert len(legs) == 2
-        # Leg 1: vertical lift at the CURRENT XY to the safe height.
+        # Leg 1: vertical lift at the CURRENT XY to the workspace's transport_z.
         p1 = legs[0].kwargs["pose"]["position"]
         assert p1["z"] == pytest.approx(0.45)
         # Leg 2: lateral translate to the drop XY at constant height.
@@ -566,65 +784,351 @@ class TestTransportingObjects:
         assert p1["x"] != p2["x"] or p1["y"] != p2["y"]
         order = [c.tool for c in ctx.calls]
         assert order == [
-            "robot.get_observation", "robot.go_to_pose_cartesian",
+            "robot.get_observation",
+            "robot.describe_arm",
+            "robot.describe_workspace",
+            "robot.grasp_frame",
+            "robot.go_to_pose_cartesian",
             "robot.go_to_pose_cartesian",
         ]
+        # Both legs fly the hand's own top-down frame.
+        R = _quat_to_matrix(legs[0].kwargs["pose"]["rotation"])
+        assert R == pytest.approx(np.diag([1.0, -1.0, -1.0]), abs=1e-9)
+        assert legs[1].kwargs["pose"]["rotation"] == legs[0].kwargs["pose"]["rotation"]
+
+    def test_waypoint_move_keeps_an_upstream_rotation_and_a_pinned_height(self, skills_registry):
+        waypoint = _script(skills_registry, "transporting-objects", "waypoint_move")
+        ctx = self._waypoint_ctx()
+        waypoint.run(ctx, drop_x=0.5, drop_y=-0.2, drop_rotation=self.WRIST, safe_height=0.60)
+        assert ctx.call_count("robot.grasp_frame") == 0
+        legs = ctx.calls_to("robot.go_to_pose_cartesian")
+        assert all(leg.kwargs["pose"]["rotation"] == self.WRIST for leg in legs)
+        assert legs[0].kwargs["pose"]["position"]["z"] == pytest.approx(0.60)
+
+    def test_waypoint_move_steps_down_a_rung_when_the_far_corner_is_out_of_reach(
+        self, skills_registry
+    ):
+        waypoint = _script(skills_registry, "transporting-objects", "waypoint_move")
+
+        def _reach_limited(**kwargs):
+            p = kwargs["pose"]["position"]
+            if p["x"] == pytest.approx(0.5) and p["z"] > 0.43:
+                raise RuntimeError("servo stopped 4 cm short")
+
+        ctx = self._waypoint_ctx(cartesian=_reach_limited)
+        out = waypoint.run(ctx, drop_x=0.5, drop_y=-0.2)
+        assert out["descents"] == 1
+        assert out["flown_z"] == pytest.approx(0.42)
+        assert self._lateral_heights(ctx) == [pytest.approx(0.45), pytest.approx(0.42)]
 
     def test_waypoint_move_failure_raises(self, skills_registry):
         waypoint = _script(skills_registry, "transporting-objects", "waypoint_move")
+
         def _second_leg_fails(**kwargs):
             if kwargs["pose"]["position"]["x"] == pytest.approx(0.5):
                 raise RuntimeError("linear plan failed")
             return None
 
-        ctx = FakeContext({
-            "robot.get_observation": _observation(),
-            "robot.go_to_pose_cartesian": _second_leg_fails,
-        })
+        ctx = self._waypoint_ctx(cartesian=_second_leg_fails)
         with pytest.raises(PlanningFailed):
             waypoint.run(ctx, drop_x=0.5, drop_y=-0.2)
+        # The cruise height and three rungs of 3 cm, all above the floor.
+        assert self._lateral_heights(ctx) == [pytest.approx(z) for z in (0.45, 0.42, 0.39, 0.36)]
+
+    def test_waypoint_move_ladder_stops_at_the_clearance_floor(self, skills_registry):
+        waypoint = _script(skills_registry, "transporting-objects", "waypoint_move")
+
+        def _never(**kwargs):
+            if kwargs["pose"]["position"]["x"] == pytest.approx(0.5):
+                raise RuntimeError("linear plan failed")
+
+        # A raised work surface: floor = 0.30 + 0.12 = 0.42, so only one rung.
+        workspace = {"transport_z": 0.45, "surface_z": 0.30, "align_clearance_m": 0.12}
+        ctx = self._waypoint_ctx(cartesian=_never, workspace=workspace)
+        with pytest.raises(PlanningFailed, match="clearance floor"):
+            waypoint.run(ctx, drop_x=0.5, drop_y=-0.2)
+        assert self._lateral_heights(ctx) == [pytest.approx(0.45), pytest.approx(0.42)]
+
+    # -- descend_release / descend_release_linear --------------------------------------
 
     def test_descend_release_sequencing(self, skills_registry):
         release = _script(skills_registry, "transporting-objects", "descend_release")
         drop_position = _vec3(0.5, -0.2, 0.2)
         drop_rotation = _quat(0.0, 1.0, 0.0, 0.0)
-        ctx = FakeContext({
-            "robot.go_to_pose": None,
-            "robot.open_gripper": {"position": 1.0},
-            "robot.go_home": None,
-        })
+        ctx = FakeContext(
+            {
+                "robot.go_to_pose": None,
+                "robot.open_gripper": {"position": 1.0},
+                "robot.describe_arm": self.ARM,
+                "robot.go_home": None,
+            }
+        )
         out = release.run(ctx, drop_position=drop_position, drop_rotation=drop_rotation)
         assert out["drop_position"] is drop_position
         # Strict descend -> release -> retract order, with the tuned
-        # open-settle so the object lands before the retract.
+        # open-settle so the object lands before the retract, and the
+        # retract on the work arm the connector names.
         order = [c.tool for c in ctx.calls]
-        assert order == ["robot.go_to_pose", "robot.open_gripper", "robot.go_home"]
+        assert order == [
+            "robot.go_to_pose",
+            "robot.open_gripper",
+            "robot.describe_arm",
+            "robot.go_home",
+        ]
         assert ctx.calls_to("robot.go_to_pose")[0].kwargs["pose"]["position"] is drop_position
         assert ctx.calls_to("robot.go_to_pose")[0].kwargs["pose"]["rotation"] is drop_rotation
         assert ctx.calls_to("robot.open_gripper")[0].kwargs["settle_steps"] == 60
+        assert ctx.calls_to("robot.go_home")[0].kwargs == {"arm_id": 0}
+
+    def test_descend_release_asks_the_hand_for_top_down(self, skills_registry):
+        release = _script(skills_registry, "transporting-objects", "descend_release")
+        ctx = FakeContext(
+            {
+                "robot.grasp_frame": self._grasp_frame,
+                "robot.go_to_pose": None,
+                "robot.open_gripper": {"position": 1.0},
+                "robot.describe_arm": self.ARM,
+                "robot.go_home": None,
+            }
+        )
+        release.run(ctx, drop_position=_vec3(0.5, -0.2, 0.2))
+        assert ctx.calls[0].tool == "robot.grasp_frame"
+        R = _quat_to_matrix(ctx.calls_to("robot.go_to_pose")[0].kwargs["pose"]["rotation"])
+        assert R == pytest.approx(np.diag([1.0, -1.0, -1.0]), abs=1e-9)
 
     def test_descend_release_linear_routes_through_connector_cartesian(self, skills_registry):
-        release = _script(
-            skills_registry, "transporting-objects", "descend_release_linear"
+        release = _script(skills_registry, "transporting-objects", "descend_release_linear")
+        ctx = FakeContext(
+            {
+                "robot.go_to_pose_cartesian": None,
+                "robot.open_gripper": {"position": 1.0},
+                "robot.get_ee_pose": {
+                    "pose": {"position": _vec3(0.5, -0.2, 0.2), "rotation": self.WRIST}
+                },
+                "robot.wait_steps": None,
+                "robot.go_home": None,
+            }
         )
-        ctx = FakeContext({
-            "robot.go_to_pose_cartesian": None,
-            "robot.open_gripper": {"position": 1.0},
-            "robot.go_home": None,
-        })
-        release.run(ctx, drop_position=_vec3(0.5, -0.2, 0.2))
+        release.run(ctx, drop_position=_vec3(0.5, -0.2, 0.2), drop_rotation=self.WRIST)
         order = [c.tool for c in ctx.calls]
-        # Linear descent now goes through the connector's TCP-aware cartesian
-        # tool; the cuRobo→plan_to_pose fallback lives inside the backend, so
-        # the script no longer needs an explicit go_to_pose fallback path.
+        # Linear descent goes through the connector's TCP-aware cartesian
+        # tool (the cuRobo→plan_to_pose fallback lives inside the backend);
+        # after the open, a short retreat at the live wrist rotation and a
+        # settle precede the large go_home swing.
         assert order == [
             "robot.go_to_pose_cartesian",
             "robot.open_gripper",
+            "robot.get_ee_pose",
+            "robot.go_to_pose_cartesian",
+            "robot.wait_steps",
             "robot.go_home",
         ]
-        cart_pose = ctx.calls_to("robot.go_to_pose_cartesian")[0].kwargs["pose"]
-        assert cart_pose["position"] == _vec3(0.5, -0.2, 0.2)
+        legs = ctx.calls_to("robot.go_to_pose_cartesian")
+        assert legs[0].kwargs["pose"]["position"] == _vec3(0.5, -0.2, 0.2)
+        assert legs[0].kwargs["pose"]["rotation"] == self.WRIST
+        retreat = legs[1].kwargs["pose"]
+        assert retreat["position"]["x"] == pytest.approx(0.5)
+        assert retreat["position"]["y"] == pytest.approx(-0.2)
+        assert retreat["position"]["z"] == pytest.approx(0.25)
+        assert retreat["rotation"] == self.WRIST
+        assert ctx.calls_to("robot.wait_steps")[0].kwargs == {"steps": 12}
         assert ctx.call_count("robot.execute_trajectory") == 0
+        assert ctx.call_count("robot.grasp_frame") == 0
+
+    def test_descend_release_linear_default_rotation_is_the_hands_top_down(self, skills_registry):
+        release = _script(skills_registry, "transporting-objects", "descend_release_linear")
+        ctx = FakeContext(
+            {
+                "robot.grasp_frame": self._grasp_frame,
+                "robot.go_to_pose_cartesian": None,
+                "robot.open_gripper": {"position": 1.0},
+                "robot.get_ee_pose": {"pose": _pose(0.5, -0.2, 0.2)},
+                "robot.wait_steps": None,
+                "robot.go_home": None,
+            }
+        )
+        release.run(ctx, drop_position=_vec3(0.5, -0.2, 0.2))
+        assert ctx.calls[0].tool == "robot.grasp_frame"
+        R = _quat_to_matrix(
+            ctx.calls_to("robot.go_to_pose_cartesian")[0].kwargs["pose"]["rotation"]
+        )
+        assert R == pytest.approx(np.diag([1.0, -1.0, -1.0]), abs=1e-9)
+
+    # -- place_release / transport_descend_linear ----------------------------------------
+
+    def test_place_release_hovers_ten_centimetres_above_the_placement(self, skills_registry):
+        release = _script(skills_registry, "transporting-objects", "place_release")
+        ctx = FakeContext(
+            {
+                "robot.open_gripper": {"position": 1.0},
+                "robot.get_ee_pose": {
+                    "pose": {"position": _vec3(0.5, -0.2, 0.04), "rotation": self.WRIST}
+                },
+                "robot.go_to_pose_cartesian": None,
+            }
+        )
+        out = release.run(ctx, place_position=_vec3(0.5, -0.2, 0.04))
+        assert out == {"done": True}
+        assert [c.tool for c in ctx.calls] == [
+            "robot.open_gripper",
+            "robot.get_ee_pose",
+            "robot.go_to_pose_cartesian",
+        ]
+        assert ctx.calls_to("robot.open_gripper")[0].kwargs["settle_steps"] == 60
+        pose = ctx.calls_to("robot.go_to_pose_cartesian")[0].kwargs["pose"]
+        # Straight up to placement + 0.10 at the wrist rotation the transport
+        # arrived with — no canonical yaw forced after the release.
+        assert pose["position"] == {"x": 0.5, "y": -0.2, "z": pytest.approx(0.14)}
+        assert pose["rotation"] == self.WRIST
+
+    def test_place_release_pinned_hover_wins(self, skills_registry):
+        release = _script(skills_registry, "transporting-objects", "place_release")
+        ctx = FakeContext(
+            {
+                "robot.open_gripper": {"position": 1.0},
+                "robot.get_ee_pose": {"pose": _pose(0.5, -0.2, 0.04)},
+                "robot.go_to_pose_cartesian": None,
+            }
+        )
+        release.run(ctx, place_position=_vec3(0.5, -0.2, 0.04), hover_z=0.353)
+        pose = ctx.calls_to("robot.go_to_pose_cartesian")[0].kwargs["pose"]
+        assert pose["position"]["z"] == pytest.approx(0.353)
+
+    class _Arm:
+        """A wrist that goes wherever the cartesian tool sends it."""
+
+        def __init__(self, pose):
+            self.pose = pose
+            self.target = None
+
+        def cartesian(self, pose):
+            self.pose = pose
+
+        def ee_pose(self):
+            return {"pose": self.pose}
+
+    def _transport_ctx(self, arm, **extra):
+        return FakeContext(
+            {
+                "robot.get_ee_pose": lambda **_: arm.ee_pose(),
+                "robot.go_to_pose_cartesian": lambda pose: arm.cartesian(pose),
+                "robot.get_observation": _observation(),
+                "curobo.plan_directed_linear": {"success": True, "trajectory": _trajectory()},
+                "robot.execute_trajectory": None,
+                **extra,
+            }
+        )
+
+    @staticmethod
+    def _leg_positions(ctx):
+        return [
+            (
+                pytest.approx(c.kwargs["pose"]["position"]["x"]),
+                pytest.approx(c.kwargs["pose"]["position"]["y"]),
+                pytest.approx(c.kwargs["pose"]["position"]["z"]),
+            )
+            for c in ctx.calls_to("robot.go_to_pose_cartesian")
+        ]
+
+    def test_transport_descend_linear_derives_its_heights(self, skills_registry):
+        transport = _script(skills_registry, "transporting-objects", "transport_descend_linear")
+        arm = self._Arm({"position": _vec3(0.3, 0.0, 0.30), "rotation": self.WRIST})
+        ctx = self._transport_ctx(arm)
+        out = transport.run(ctx, container_obb=self.CONTAINER, place_offset=-0.06)
+        # rim 0.10, place_offset -0.06 -> place_z 0.16 just above the rim;
+        # lift_z = max(0.16 + 0.07, min(0.30, 0.16 + 0.08)) = 0.24;
+        # transport_z = 0.16 + 0.08 = 0.24 — from the container, not a literal.
+        assert out["place_position"] == {
+            "x": pytest.approx(0.5),
+            "y": pytest.approx(-0.2),
+            "z": pytest.approx(0.16),
+        }
+        assert self._leg_positions(ctx) == [(0.3, 0.0, 0.24), (0.5, -0.2, 0.24)]
+        legs = ctx.calls_to("robot.go_to_pose_cartesian")
+        # The wrist keeps the rotation it arrived with.
+        assert all(leg.kwargs["pose"]["rotation"] == self.WRIST for leg in legs)
+        # The descend is the axis-locked linear leg over the remaining 8 cm.
+        plan = ctx.calls_to("curobo.plan_directed_linear")[0].kwargs
+        assert plan["distance"] == pytest.approx(0.08)
+        assert plan["allowed_axes"] == ["Z"]
+        assert plan["orientation_mode"] == "LOCK"
+        assert ctx.calls_to("robot.execute_trajectory")[0].kwargs["max_steps_per_waypoint"] == 60
+        assert ctx.call_count("robot.go_to_pose") == 0
+        assert ctx.call_count("curobo.plan_to_pose") == 0
+
+    def test_transport_descend_linear_pinned_heights_win(self, skills_registry):
+        transport = _script(skills_registry, "transporting-objects", "transport_descend_linear")
+        arm = self._Arm({"position": _vec3(0.3, 0.0, 0.30), "rotation": self.WRIST})
+        ctx = self._transport_ctx(arm)
+        out = transport.run(
+            ctx, container_obb=self.CONTAINER, transport_z=0.353, lift_z=0.25, place_offset=0.06
+        )
+        assert out["place_position"]["z"] == pytest.approx(0.04)
+        assert self._leg_positions(ctx) == [(0.3, 0.0, 0.25), (0.5, -0.2, 0.353)]
+        plan = ctx.calls_to("curobo.plan_directed_linear")[0].kwargs
+        assert plan["distance"] == pytest.approx(0.353 - 0.04)
+
+    def test_transport_leg_that_stops_short_raises(self, skills_registry):
+        transport = _script(skills_registry, "transporting-objects", "transport_descend_linear")
+        # A wrist that never moves: every leg comes back >3 cm short, so the
+        # best-effort lift is skipped and the reachable-interior search
+        # exhausts rather than reporting a place that did not happen.
+        ctx = FakeContext(
+            {
+                "robot.get_ee_pose": {
+                    "pose": {"position": _vec3(0.3, 0.0, 0.30), "rotation": self.WRIST}
+                },
+                "robot.go_to_pose_cartesian": None,
+            }
+        )
+        with pytest.raises(RuntimeError, match="no reachable point"):
+            transport.run(ctx, container_obb=self.CONTAINER)
+        # The preferred centre, then the four interior corners 1.5 cm inside
+        # the half-extents (the centre again is deduplicated).
+        tried = [(x, y) for x, y, _z in self._leg_positions(ctx)[1:]]
+        assert tried == [
+            (0.5, -0.2),
+            (0.415, -0.285),
+            (0.415, -0.115),
+            (0.585, -0.285),
+            (0.585, -0.115),
+        ]
+        assert ctx.call_count("curobo.plan_directed_linear") == 0
+
+    def test_transport_falls_back_to_a_planned_leg(self, skills_registry):
+        transport = _script(skills_registry, "transporting-objects", "transport_descend_linear")
+        arm = self._Arm({"position": _vec3(0.3, 0.0, 0.30), "rotation": self.WRIST})
+
+        def _cartesian(pose):
+            # The straight-line lateral leg is refused from this configuration.
+            if pose["position"]["x"] == pytest.approx(0.5) and arm.target is None:
+                raise RuntimeError("joint-limit basin")
+            arm.cartesian(pose)
+
+        def _plan(target_pose, start_joint_position):
+            arm.target = target_pose
+            return {"success": True, "trajectory": _trajectory()}
+
+        def _execute(trajectory, max_steps_per_waypoint=0):
+            if arm.target is not None:
+                arm.pose = arm.target
+
+        ctx = self._transport_ctx(
+            arm,
+            **{
+                "robot.go_to_pose_cartesian": _cartesian,
+                "curobo.plan_to_pose": _plan,
+                "robot.execute_trajectory": _execute,
+            },
+        )
+        out = transport.run(ctx, container_obb=self.CONTAINER, place_offset=-0.06)
+        # One planned reconfiguration to the same pose, then the leg counts
+        # as reached and the place proceeds at the container centre.
+        assert ctx.call_count("curobo.plan_to_pose") == 1
+        plan = ctx.calls_to("curobo.plan_to_pose")[0].kwargs
+        assert plan["target_pose"]["position"]["x"] == pytest.approx(0.5)
+        assert out["place_position"]["x"] == pytest.approx(0.5)
+        assert out["place_position"]["z"] == pytest.approx(0.16)
 
 
 # ---------------------------------------------------------------------------
@@ -647,17 +1151,19 @@ class _StubStream:
 def _tracker_ctx(update_responses, init_present=True):
     mask = np.full((8, 8), 255, dtype=np.uint8)
     box = {"x1": 1.0, "y1": 1.0, "x2": 5.0, "y2": 5.0}
-    return FakeContext({
-        "sam3.tracker_init": {
-            "tracker_id": "trk-1" if init_present else "",
-            "initial_mask": mask if init_present else None,
-            "initial_box": box if init_present else None,
-            "score": 0.9 if init_present else 0.0,
-            "object_present": init_present,
-        },
-        "sam3.tracker_update": list(update_responses),
-        "sam3.tracker_close": {"closed": True},
-    })
+    return FakeContext(
+        {
+            "sam3.tracker_init": {
+                "tracker_id": "trk-1" if init_present else "",
+                "initial_mask": mask if init_present else None,
+                "initial_box": box if init_present else None,
+                "score": 0.9 if init_present else 0.0,
+                "object_present": init_present,
+            },
+            "sam3.tracker_update": list(update_responses),
+            "sam3.tracker_close": {"closed": True},
+        }
+    )
 
 
 def _upd(present=True, conf=0.8):
@@ -677,8 +1183,11 @@ class TestTrackingObjects:
         ctx = _tracker_ctx([_upd(conf=0.8), _upd(conf=0.7), _upd(conf=0.95)])
 
         out = skill.run(
-            ctx, observation_stream=stream, target_prompt="red cup",
-            max_updates=3, update_hz=1e6,
+            ctx,
+            observation_stream=stream,
+            target_prompt="red cup",
+            max_updates=3,
+            update_hz=1e6,
         )
 
         assert ctx.call_count("sam3.tracker_init") == 1
@@ -704,12 +1213,20 @@ class TestTrackingObjects:
         ctx = _tracker_ctx([_upd(), _upd()])
 
         skill.run(
-            ctx, observation_stream=stream, target_prompt="red cup",
-            max_updates=1, update_hz=1e6, close_on_exit=False,
+            ctx,
+            observation_stream=stream,
+            target_prompt="red cup",
+            max_updates=1,
+            update_hz=1e6,
+            close_on_exit=False,
         )
         skill.run(
-            ctx, observation_stream=stream, target_prompt="red cup",
-            max_updates=1, update_hz=1e6, close_on_exit=False,
+            ctx,
+            observation_stream=stream,
+            target_prompt="red cup",
+            max_updates=1,
+            update_hz=1e6,
+            close_on_exit=False,
         )
         # tracker_init ran exactly once across both visits; the second
         # visit resumed the open session.
@@ -728,8 +1245,12 @@ class TestTrackingObjects:
         stream = _StubStream(_observation())
         ctx = _tracker_ctx([_upd(present=False)] * 5)
         out = skill.run(
-            ctx, observation_stream=stream, target_prompt="red cup",
-            max_updates=5, update_hz=1e6, allow_lost_frames=2,
+            ctx,
+            observation_stream=stream,
+            target_prompt="red cup",
+            max_updates=5,
+            update_hz=1e6,
+            allow_lost_frames=2,
         )
         assert ctx.call_count("sam3.tracker_update") == 2
         assert out["object_present"] is False
@@ -743,8 +1264,11 @@ class TestTrackingObjects:
         stream = _StubStream(_observation())
         ctx = _tracker_ctx([], init_present=False)
         out = skill.run(
-            ctx, observation_stream=stream, target_prompt="unicorn",
-            max_updates=5, update_hz=1e6,
+            ctx,
+            observation_stream=stream,
+            target_prompt="unicorn",
+            max_updates=5,
+            update_hz=1e6,
         )
         assert out["object_present"] is False
         assert out["n_updates"] == 0
@@ -756,9 +1280,12 @@ class TestTrackingObjects:
         stream = _StubStream(_observation())
         ctx = _tracker_ctx([_upd()])
         out = tool_registry.invoke(
-            "tracking-objects.track", ctx=ctx,
-            observation_stream=stream, target_prompt="red cup",
-            max_updates=1, update_hz=1e6,
+            "tracking-objects.track",
+            ctx=ctx,
+            observation_stream=stream,
+            target_prompt="red cup",
+            max_updates=1,
+            update_hz=1e6,
         )
         assert out["n_updates"] == 1
         assert ctx.call_count("sam3.tracker_init") == 1
@@ -821,7 +1348,11 @@ class TestPolicySkills:
         client = _StubClient([chunk, chunk])
         ctx = _policy_ctx()
         out, executor, stream = self._run(
-            skills_registry, ctx, client, max_windows=2, replan_every=2,
+            skills_registry,
+            ctx,
+            client,
+            max_windows=2,
+            replan_every=2,
         )
         assert out == {"status": "max_windows", "num_windows": 2, "num_steps": 4}
         # One client resolution through the executor's cache, keyed by the
@@ -843,8 +1374,12 @@ class TestPolicySkills:
         client = _StubClient([chunk])
         ctx = _policy_ctx()
         self._run(
-            skills_registry, ctx, client,
-            max_windows=1, replan_every=1, settle_steps=3,
+            skills_registry,
+            ctx,
+            client,
+            max_windows=1,
+            replan_every=1,
+            settle_steps=3,
         )
         calls = ctx.calls_to("sim.apply_policy_action")
         assert len(calls) == 3 + 1
@@ -861,8 +1396,12 @@ class TestPolicySkills:
         client = _StubClient([chunk(1.0), chunk(1.0), chunk(1.0), chunk(-1.0)])
         ctx = _policy_ctx()
         out, _, _ = self._run(
-            skills_registry, ctx, client,
-            max_windows=10, replan_every=1, gripper_cycle_termination=True,
+            skills_registry,
+            ctx,
+            client,
+            max_windows=10,
+            replan_every=1,
+            gripper_cycle_termination=True,
         )
         assert out["status"] == "gripper_cycle"
         assert out["num_windows"] == 4
@@ -878,8 +1417,12 @@ class TestPolicySkills:
         client = _StubClient([chunk(1.0), chunk(-1.0), chunk(0.0)])
         ctx = _policy_ctx()
         out, _, _ = self._run(
-            skills_registry, ctx, client,
-            max_windows=3, replan_every=1, gripper_cycle_termination=True,
+            skills_registry,
+            ctx,
+            client,
+            max_windows=3,
+            replan_every=1,
+            gripper_cycle_termination=True,
         )
         assert out["status"] == "max_windows"
 
@@ -888,9 +1431,13 @@ class TestPolicySkills:
         client = _StubClient([chunk] * 3)
         ctx = _policy_ctx({"vlm.query_yes_no": {"answer": True, "text": "yes"}})
         out, _, _ = self._run(
-            skills_registry, ctx, client,
-            max_windows=10, replan_every=1,
-            termination_prompt="is the object in the basket?", term_period=1,
+            skills_registry,
+            ctx,
+            client,
+            max_windows=10,
+            replan_every=1,
+            termination_prompt="is the object in the basket?",
+            term_period=1,
         )
         assert out["status"] == "completed_by_vlm"
         assert out["num_windows"] == 1
@@ -915,10 +1462,13 @@ class TestPolicySkills:
         ctx = _policy_ctx()
         ctx.policy_executor = _StubPolicyExecutor(client)
         out = tool_registry.invoke(
-            "pi05-libero.run", ctx=ctx,
+            "pi05-libero.run",
+            ctx=ctx,
             observation_stream=_StubStream(_observation()),
-            prompt="pick", settle_steps=0,
-            max_windows=1, replan_every=1,
+            prompt="pick",
+            settle_steps=0,
+            max_windows=1,
+            replan_every=1,
         )
         assert out["status"] == "max_windows"
         assert out["num_steps"] == 1
@@ -928,8 +1478,12 @@ class TestPolicySkills:
         client = _StubClient([chunk])
         ctx = _policy_ctx()
         _, executor, _ = self._run(
-            skills_registry, ctx, client, bundle="molmoact-libero",
-            max_windows=1, replan_every=1,
+            skills_registry,
+            ctx,
+            client,
+            bundle="molmoact-libero",
+            max_windows=1,
+            replan_every=1,
         )
         # Each policy skill resolves the client cache by its own preset
         # (bundle name), proving the model identity is per-skill.

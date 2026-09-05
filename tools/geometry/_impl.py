@@ -645,6 +645,7 @@ def filter_noise(points: np.ndarray, eps: float, min_samples: int) -> np.ndarray
     Mirrors HyRL filter_noise: keeps ALL non-noise points (labels != -1),
     not just the largest cluster.
     """
+
     from sklearn.cluster import DBSCAN
 
     if len(points) == 0:
@@ -660,6 +661,115 @@ def filter_noise(points: np.ndarray, eps: float, min_samples: int) -> np.ndarray
         return points
 
     return filtered
+
+
+def _significant_clusters(
+    points: np.ndarray, eps: float, min_samples: int
+) -> list[np.ndarray]:
+    """Keep every meaningful connected surface, not only the largest one."""
+    from sklearn.cluster import DBSCAN
+
+    if len(points) < 4:
+        return []
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points)
+    ids, counts = np.unique(labels[labels >= 0], return_counts=True)
+    threshold = max(int(min_samples) * 3, int(math.ceil(len(points) * 0.002)))
+    clusters = [points[labels == label] for label, count in zip(ids, counts) if count >= threshold]
+    if clusters:
+        return clusters
+    non_noise = points[labels >= 0]
+    return [non_noise if len(non_noise) >= 4 else points]
+
+
+def _planar_slab_mesh(
+    points: np.ndarray, thickness: float
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Turn a planar point cluster into a closed thin convex collision slab."""
+    from scipy.spatial import ConvexHull
+
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if len(pts) < 4:
+        return None
+    center = np.median(pts, axis=0)
+    _, _, vh = np.linalg.svd(pts - center, full_matrices=False)
+    u, v, normal = vh[0], vh[1], vh[2]
+    distances = np.abs((pts - center) @ normal)
+    if float(np.percentile(distances, 95)) > max(float(thickness), 0.012):
+        return None
+    uv = np.column_stack(((pts - center) @ u, (pts - center) @ v))
+    try:
+        hull = ConvexHull(uv)
+    except Exception:
+        return None
+    polygon = uv[hull.vertices]
+    if len(polygon) < 3:
+        return None
+    mid = center + polygon[:, :1] * u + polygon[:, 1:] * v
+    half = max(float(thickness), 0.004) * 0.5
+    vertices = np.concatenate([mid + half * normal, mid - half * normal], axis=0)
+    n = len(polygon)
+    faces: list[list[int]] = []
+    for i in range(1, n - 1):
+        faces.append([0, i, i + 1])
+        faces.append([n, n + i + 1, n + i])
+    for i in range(n):
+        j = (i + 1) % n
+        faces.extend(([i, j, n + j], [i, n + j, n + i]))
+    return vertices.astype(np.float32), np.asarray(faces, dtype=np.int32)
+
+
+def _extract_planar_surfaces(
+    points: np.ndarray,
+    distance_threshold: float,
+    *,
+    min_points: int = 30,
+    min_fraction: float = 0.02,
+    max_planes: int = 8,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Iteratively separate planes that may touch in one DBSCAN component.
+
+    Connectivity alone cannot distinguish a tabletop from a fixture board:
+    their depth samples meet along an edge.  RANSAC plane extraction is done
+    before surface meshing so perpendicular or tilted planes get independent
+    collision slabs instead of an alpha shape bridging the two.
+    """
+    import open3d as o3d
+
+    remaining = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    planes: list[np.ndarray] = []
+    original_count = len(remaining)
+    required = max(int(min_points), int(math.ceil(original_count * min_fraction)))
+    threshold = max(float(distance_threshold), 0.003)
+
+    for _ in range(max_planes):
+        if len(remaining) < required:
+            break
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(remaining)
+        try:
+            _, inliers = pcd.segment_plane(
+                distance_threshold=threshold,
+                ransac_n=3,
+                num_iterations=300,
+            )
+        except Exception as exc:
+            logger.warning("plane extraction failed: %s", exc)
+            break
+        indices = np.asarray(inliers, dtype=np.int64)
+        if len(indices) < required:
+            break
+        candidate = remaining[indices]
+        # Reject line-like RANSAC consensus sets. A useful support/fixture
+        # surface must span two dimensions by more than the depth tolerance.
+        singular = np.linalg.svd(candidate - np.median(candidate, axis=0), compute_uv=False)
+        if len(singular) < 2 or singular[1] < threshold * 2.0:
+            break
+        planes.append(candidate.astype(np.float32))
+        keep = np.ones(len(remaining), dtype=bool)
+        keep[indices] = False
+        remaining = remaining[keep]
+
+    return planes, remaining.astype(np.float32)
 
 
 def compute_obb(points: np.ndarray) -> OrientedBoundingBox:
@@ -919,19 +1029,21 @@ def build_world_config(
     mesh_alpha: float,
     robot_joint_state,
     robot_distance_threshold: float,
+    robot_spheres: list[dict] | None,
+    robot_sphere_margin: float,
     target_obb: OrientedBoundingBox | None,
     target_obb_name: str,
 ) -> tuple[dict, list[str]]:
     """Build a planner-agnostic collision world from camera observations.
 
     Pipeline (verbatim from the servicer): merge depth clouds → voxel
-    downsample → FK-based robot exclusion → DBSCAN largest-cluster filter →
-    table-plane removal → object-mask point marking → alpha-shape scene mesh.
+    downsample → FK-based robot exclusion → multi-cluster noise filtering →
+    object-mask point marking → iterative plane separation → planar slabs /
+    residual per-cluster alpha-shape meshes.
 
     Returns ``(WorldConfig dict, mesh_names)``.
     """
     import open3d as o3d
-    from sklearn.cluster import DBSCAN
 
     table_z = table_z_threshold
 
@@ -976,6 +1088,35 @@ def build_world_config(
     pcd = pcd.voxel_down_sample(voxel_size)
     merged = np.asarray(pcd.points).astype(np.float32)
 
+    # ----- Step 2a: embodiment-independent robot exclusion -----
+    # Spheres are captured with the RGB-D observation by the robot's own
+    # planner model. Removing returns here, before clustering/meshing, avoids
+    # stale arm-shaped obstacle meshes after the robot has moved.
+    sphere_rows = []
+    for sphere in robot_spheres or []:
+        center = sphere.get("center") or {}
+        radius = float(sphere.get("radius", 0.0))
+        if radius > 0.0:
+            sphere_rows.append([
+                float(center.get("x", 0.0)),
+                float(center.get("y", 0.0)),
+                float(center.get("z", 0.0)),
+                radius,
+            ])
+    if sphere_rows and len(merged):
+        spheres_np = np.asarray(sphere_rows, dtype=np.float64)
+        remove = np.zeros(len(merged), dtype=bool)
+        for start in range(0, len(spheres_np), 64):
+            chunk = spheres_np[start : start + 64]
+            delta = merged[:, None, :] - chunk[None, :, :3]
+            radii = chunk[None, :, 3] + max(float(robot_sphere_margin), 0.0)
+            remove |= np.any(np.sum(delta * delta, axis=2) <= radii * radii, axis=1)
+        logger.info(
+            "build_world_config: removed %d/%d points using %d captured robot spheres",
+            int(np.count_nonzero(remove)), len(merged), len(spheres_np),
+        )
+        merged = merged[~remove]
+
     # ----- Step 2b: Robot point exclusion (matching HyRL) -----
     # _exclude_robot_points uses Franka-specific FK; skip for non-7-DOF robots.
     if robot_joint_state is not None:
@@ -997,14 +1138,11 @@ def build_world_config(
             )
 
     # ----- Step 3: DBSCAN noise filtering -----
+    # Preserve every significant surface. Keeping only the largest cluster
+    # erases elevated tables, boards and shelves in general workcells.
     if len(merged) > 0:
-        labels = DBSCAN(eps=noise_eps, min_samples=noise_min_samples).fit_predict(
-            merged
-        )
-        unique, counts = np.unique(labels[labels >= 0], return_counts=True)
-        if len(unique) > 0:
-            largest = unique[np.argmax(counts)]
-            merged = merged[labels == largest]
+        clusters = _significant_clusters(merged, noise_eps, noise_min_samples)
+        merged = np.concatenate(clusters, axis=0) if clusters else merged[:0]
 
     # ----- Step 4: Remove table / ground plane below threshold -----
     if table_z != 0 and len(merged) > 0:
@@ -1084,7 +1222,7 @@ def build_world_config(
             close_mask = dists < voxel_size * 3
             object_point_indices.update(np.where(close_mask)[0].tolist())
 
-    # ----- Step 6: Scene mesh from remaining points -----
+    # ----- Step 6: Scene meshes from remaining connected surfaces -----
     if len(merged) > 0:
         scene_mask = np.ones(len(merged), dtype=bool)
         for idx in object_point_indices:
@@ -1093,34 +1231,72 @@ def build_world_config(
         scene_pts = merged[scene_mask]
 
         if len(scene_pts) >= 4:
-            scene_pcd = o3d.geometry.PointCloud()
-            scene_pcd.points = o3d.utility.Vector3dVector(
-                scene_pts.astype(np.float64)
-            )
-            try:
-                scene_mesh = (
-                    o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
-                        scene_pcd, mesh_alpha
+            scene_clusters = _significant_clusters(scene_pts, noise_eps, noise_min_samples)
+            surface_parts: list[tuple[np.ndarray, bool]] = []
+            for cluster in scene_clusters:
+                planes, residual = _extract_planar_surfaces(
+                    cluster,
+                    distance_threshold=max(voxel_size * 1.5, 0.004),
+                    min_points=max(noise_min_samples * 3, 30),
+                )
+                surface_parts.extend((plane, True) for plane in planes)
+                if len(residual) >= 4:
+                    residual_clusters = _significant_clusters(
+                        residual, noise_eps, noise_min_samples
                     )
-                )
-                scene_mesh.compute_vertex_normals()
-                s_verts = np.asarray(scene_mesh.vertices).astype(np.float32)
-                s_faces = np.asarray(scene_mesh.triangles).astype(np.int32)
+                    surface_parts.extend((part, False) for part in residual_clusters)
 
-                if len(s_verts) > 0 and len(s_faces) > 0:
-                    collision_meshes.append({
-                        "name": "scene",
-                        "vertices": s_verts,
-                        "faces": s_faces,
-                        "pose": {
-                            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
-                            "rotation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
-                        },
-                    })
-                    mesh_names.append("scene")
-            except Exception as exc:
-                logger.warning(
-                    "build_world_config: scene alpha shape failed: %s", exc
+            for index, (surface, is_plane) in enumerate(surface_parts):
+                mesh = (
+                    _planar_slab_mesh(surface, max(voxel_size, 0.006))
+                    if is_plane
+                    else None
                 )
+                if mesh is None:
+                    scene_pcd = o3d.geometry.PointCloud()
+                    scene_pcd.points = o3d.utility.Vector3dVector(surface.astype(np.float64))
+                    try:
+                        scene_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+                            scene_pcd, mesh_alpha
+                        )
+                        mesh = (
+                            np.asarray(scene_mesh.vertices).astype(np.float32),
+                            np.asarray(scene_mesh.triangles).astype(np.int32),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "build_world_config: surface %d alpha shape failed: %s", index, exc
+                        )
+                        continue
+                s_verts, s_faces = mesh
+                if not len(s_verts) or not len(s_faces):
+                    continue
+                extent = np.ptp(s_verts, axis=0)
+                # Reject only components that are simultaneously sparse,
+                # nearly zero-thickness, and local. These are characteristic
+                # alpha-shape depth-edge fragments, not substantive scene
+                # surfaces. Large walls and thin planar fixtures are retained.
+                if (
+                    len(s_verts) < 32
+                    and float(extent.min()) < 0.004
+                    and float(extent.max()) < 0.15
+                ):
+                    logger.info(
+                        "build_world_config: dropped sparse depth-edge sliver "
+                        "surface=%d vertices=%d extent=%s",
+                        index, len(s_verts), extent.tolist(),
+                    )
+                    continue
+                name = f"scene_{index}"
+                collision_meshes.append({
+                    "name": name,
+                    "vertices": s_verts,
+                    "faces": s_faces,
+                    "pose": {
+                        "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "rotation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+                    },
+                })
+                mesh_names.append(name)
 
     return {"meshes": collision_meshes}, mesh_names

@@ -100,7 +100,12 @@ def pose_dict(pos, rot):
 def plan_to(ctx, arm, pos, phi_deg, n=12, tol=0.006, allow_joint=True):
     """One arm's dense joint track to a pinch-point pose with the wrist locked.
     Linear first; a refused straight line falls back to an eased joint move for
-    the short chord, which for a few centimetres is the same path."""
+    the short chord, which for a few centimetres is the same path.
+
+    The fallback is not only a fallback: `plan_linear(orientation="lock")` applies
+    a NEW rotation as a step at its first waypoint, and that step is what slid the
+    wall 45 mm in the pads. `plan_joint` eases the joints between the two IK
+    solutions instead, so a move that turns the wrist wants the joint plan."""
     rot, fr = frame(ctx, arm, phi_deg)
     end = pose_dict(pos, rot)
     plan = ctx.tool("motion.plan_linear", end=end, arm_id=arm["arm_id"], orientation="lock", tolerance=tol, num_waypoints=n)
@@ -144,18 +149,6 @@ def theta_on_corner(h_above_table):
     return math.degrees(math.asin(s)) - BETA
 
 
-def pin_about_floor_corner(corner, theta_deg, sign_y):
-    """Pinch point when the crate rotates about its floor-side near corner."""
-    t = math.radians(theta_deg)
-    return [corner[0] + R_PIN * math.cos(t) - HZ * math.sin(t), sign_y, corner[2] + R_PIN * math.sin(t) + HZ * math.cos(t)]
-
-
-def pin_about_rim_corner(corner, theta_deg, sign_y):
-    """Pinch point when the crate rotates about its rim-side near corner."""
-    t = math.radians(theta_deg)
-    return [corner[0] + R_PIN * math.cos(t) + HZ * math.sin(t), sign_y, corner[2] + R_PIN * math.sin(t) - HZ * math.cos(t)]
-
-
 def ee(ctx, arm):
     p = ctx.tool("robot.get_ee_pose", arm_id=arm["arm_id"])["pose"]["position"]
     return [p["x"], p["y"], p["z"]]
@@ -174,24 +167,3 @@ def slip(ctx, arms, st=None):
         g = ctx.tool("robot.get_gripper", arm_id=a["arm_id"])
         out[a["name"]] = {"dx_mm": round(loc[0] * 1000, 1), "dz_mm": round(loc[2] * 1000, 1), "grip": g.get("position")}
     return out
-
-
-def roll_pair(ctx, arms, phi_deg, n=10, settle=2, max_jump=0.6):
-    """Turn both wrists IN PLACE to roll `phi_deg`, smoothly. plan_linear(lock)
-    would apply the new rotation as a step at its first waypoint (that step is
-    what slid the wall 45 mm in the pads); plan_joint eases the joints between
-    the two solutions instead. Refuses a solution that jumps a joint by more
-    than `max_jump` rad -- that is the other wrist branch, a half-turn away."""
-    tracks = {}
-    for arm in arms:
-        pos = ee(ctx, arm)
-        rot, _ = frame(ctx, arm, phi_deg)
-        pj = ctx.tool("motion.plan_joint", pose=pose_dict(pos, rot), arm_id=arm["arm_id"], orientation="lock", num_waypoints=n)
-        perr, rerr = float(pj["position_error_m"]), float(pj["rotation_error_rad"])
-        wps = [w["positions"] for w in pj["trajectory"]["waypoints"]]
-        jump = max(abs(a - b) for a, b in zip(wps[0], wps[-1])) if len(wps) > 1 else 0.0
-        log("roll_plan", arm=arm["name"], phi=phi_deg, err_m=perr, rot_err_deg=math.degrees(rerr), joint_jump=jump)
-        if perr > 0.01 or rerr > math.radians(6.0) or jump > max_jump:
-            raise RuntimeError(f"{arm['name']} cannot roll to {phi_deg:.1f}: {perr*1000:.1f} mm, {math.degrees(rerr):.1f} deg, jump {jump:.2f} rad")
-        tracks[str(arm["arm_id"])] = wps
-    ctx.tool("robot.stream_dual", tracks=tracks, tolerance=0.01, settle_steps=int(settle))

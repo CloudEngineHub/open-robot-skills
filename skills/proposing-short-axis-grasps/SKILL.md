@@ -1,15 +1,16 @@
 ---
 name: proposing-short-axis-grasps
 description: Propose top-down grasps whose jaws close ACROSS an elongated
-  object's short axis, derived from its oriented box. Use as the first
-  grasp-proposal rung for anything longer than it is wide — a handle, a
+  object's short axis, derived from its oriented box. Use when the object is
+  longer than it is wide, as the first grasp-proposal rung — a handle, a
   spanner, a screwdriver, a bar, a laid-down bottle — where closing along the
   length would put the fingers down the object and meet them on each other.
   Declines when the short axis is wider than the hand opens, which is the
   signal to try `proposing-side-grasps` rather than to re-tune this one.
 compatibility: requires gap>=0.1
-metadata: {category: grasping, tags: [grasping, propose, geometric, cpu]}
+metadata: {category: grasping, tags: [grasping, propose, geometric, cpu, sim-only]}
 gap:
+  requires: {connector: [sim.get_object_obb, robot.describe_gripper, robot.grasp_frame]}
   allowed_tools:
     - sim.get_object_obb
     - robot.describe_gripper

@@ -9,8 +9,9 @@ description: Turn a body over on the surface it rests on instead of carrying
   about its own closing axis), when the body is too big to turn over in hand,
   or when the arm's envelope cannot follow a held body through the roll.
 compatibility: requires gap>=0.1
-metadata: {category: manipulation, tags: [bimanual, tipping, flipping, pivot, loose-grasp, cpu]}
+metadata: {category: manipulation, tags: [bimanual, tipping, flipping, pivot, loose-grasp, cpu, sim-only]}
 gap:
+  requires: {connector: [sim.get_object_pose, sim.query, robot.describe_arm, robot.describe_gripper, robot.grasp_frame, robot.set_grip, robot.stream_dual, robot.wait_steps, motion.plan_linear, motion.plan_joint]}
   allowed_tools:
     - sim.get_object_pose
     - sim.query

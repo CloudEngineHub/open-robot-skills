@@ -35,14 +35,35 @@ dependencies = [
 # are ever needed.
 perceiving-objects = []
 tipping-over-a-surface-edge = []
+placing-held-feature = []
+proposing-short-axis-grasps = []
+proposing-side-grasps = []
+selecting-reachable-grasp = []
 perceiving-objects-oneshot = []
 perceiving-object-parts = []
 perceiving-next-item = []
+perceiving-functional-features = []
+perceiving-sorting-pairs = []
 grasping-with-planner = []
 grasping-direct-ik = []
 grasping-short-axis = []
+grasping-linear-feature = []
 transporting-objects = []
+executing-feature-mating = []
+executing-held-object-motion = []
+planning-held-object-motion = []
+computing-feature-mating-poses = []
+registering-held-objects = []
 tracking-objects = []
+perceiving-deformable-linear-objects = []
+perceiving-routing-fixtures = []
+verifying-a-cable-route = []
+seating-a-cable-crossing = []
+anchoring-a-free-end = []
+plugging-a-cable-end = []
+reconstructing-collision-worlds = []
+verifying-grasps = []
+verifying-placement = []
 
 # Historical meta-extras: bundle deps now live in each bundle's own
 # pyproject.toml (synced via `gap skills install <name>`), so these are
@@ -101,6 +122,11 @@ ignore = ["E501"]
 # percent-format, zip-strict) is kept as-ported to ease diffing against the
 # source tree.
 "tools/curobo/_curobo_impl.py" = ["E402", "F401", "F841", "UP031", "B905"]
+# Vendored TrackDLO (MIT): kept byte-close to upstream so it diffs cleanly -- see
+# the file header. Its style debt (unused loop variables, an ambiguous name, an
+# unused import and locals, an unsorted import block, a percent-format) stays as
+# vendored. Never `ruff format` this file for the same reason.
+"tools/curve/_trackdlo.py" = ["B007", "E741", "F401", "F841", "I001", "UP032"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
