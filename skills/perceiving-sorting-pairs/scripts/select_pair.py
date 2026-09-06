@@ -6,12 +6,21 @@ is called -- is supplied by the graph through ``identity_hints`` and
 """
 
 import json
+import os
 import re
+import sys
 from typing import Any, TypedDict
 
 import numpy as np
 from gap import NodeContext
-from PIL import Image, ImageDraw
+
+# The runtime loads each node script standalone, so a sibling is not importable
+# by package path. Put this script's own directory on the path and import it by
+# name -- the same thing the runtime does for the entry module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sorting_cv import bounds as _bounds  # noqa: E402
+from sorting_cv import box as _box  # noqa: E402
+from sorting_cv import camera as _camera  # noqa: E402
 
 
 class Output(TypedDict, total=False):
@@ -25,21 +34,6 @@ class Output(TypedDict, total=False):
 
 
 _DEFAULT_IDENTITY_HINT = "Identify the narrow graspable handle or graspable body."
-
-
-def _camera(observation: dict[str, Any], name: str) -> dict[str, Any]:
-    cameras = observation.get("cameras") or []
-    if isinstance(cameras, dict):
-        cameras = list(cameras.values())
-    return next(camera for camera in cameras if camera.get("name") == name)
-
-
-def _box(detection: dict[str, Any]) -> dict[str, Any]:
-    return detection.get("box") or detection.get("bbox") or detection
-
-
-def _bounds(box: dict[str, Any]) -> tuple[float, float, float, float]:
-    return tuple(float(box[key]) for key in ("x1", "y1", "x2", "y2"))
 
 
 def _normalize(label: str) -> str:
@@ -83,63 +77,6 @@ def _empty_result(status: str) -> Output:
         "target_cloud": {"points": np.empty((0, 3), dtype=np.float32)},
         "destination_obb": empty_obb,
     }
-
-
-def _best_box(
-    ctx: NodeContext, image: Any, query: str, inside: tuple[float, ...] | None = None
-) -> dict[str, Any]:
-    detections = (
-        ctx.tool("grounding-dino.detect", image=image, query=query, box_threshold=0.10).get(
-            "detections"
-        )
-        or []
-    )
-    candidates = []
-    for detection in detections:
-        box = _box(detection)
-        x1, y1, x2, y2 = _bounds(box)
-        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-        if inside is not None and not (
-            inside[0] <= cx <= inside[2] and inside[1] <= cy <= inside[3]
-        ):
-            continue
-        candidates.append((float(detection.get("score", 0.0)), box))
-    if not candidates:
-        raise ValueError(f"could not localize {query!r}")
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    candidates = candidates[:6]
-    crops = []
-    height, width = np.asarray(image).shape[:2]
-    overview = Image.fromarray(np.asarray(image, dtype=np.uint8)).convert("RGB")
-    draw = ImageDraw.Draw(overview)
-    for index, (_, box) in enumerate(candidates):
-        x1, y1, x2, y2 = _bounds(box)
-        draw.rectangle((x1, y1, x2, y2), outline=(255, 255, 0), width=3)
-        draw.text(
-            (x1 + 3, y1 + 3),
-            str(index),
-            fill=(255, 0, 0),
-            stroke_width=2,
-            stroke_fill=(255, 255, 255),
-        )
-        xa, ya = max(0, int(x1)), max(0, int(y1))
-        xb, yb = min(width, int(np.ceil(x2))), min(height, int(np.ceil(y2)))
-        crops.append(np.asarray(image)[ya:yb, xa:xb])
-    answer = ctx.tool(
-        "vlm.query",
-        images=[np.asarray(overview), *crops],
-        prompt=(
-            f"The first image is the full scene with candidate boxes numbered 0 through "
-            f"{len(crops) - 1}; the remaining images are those crops in the same order. "
-            f"Which numbered box most specifically encloses the complete {query}, rather than "
-            "another tool, a printed label, or a multi-object group? Prefer a tight complete-object "
-            "box over a larger group box. Reply exactly INDEX: <number>."
-        ),
-    )["text"]
-    match = re.search(r"INDEX\s*:\s*(\d+)", str(answer), re.I)
-    if not match or int(match.group(1)) >= len(candidates):
-        raise ValueError(f"VLM did not select a valid {query!r} candidate: {answer!r}")
-    return candidates[int(match.group(1))][1]
 
 
 def _source_box(ctx: NodeContext, image: Any, query: str) -> dict[str, Any]:

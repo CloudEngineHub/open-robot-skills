@@ -1,11 +1,20 @@
 """Discover a labelled 2x2 destination layout from one calibrated RGB-D view."""
 
 import json
+import os
 import re
+import sys
 from typing import Any, TypedDict
 
 import numpy as np
 from gap import NodeContext
+
+# The runtime loads each node script standalone, so a sibling is not importable
+# by package path. Put this script's own directory on the path and import it by
+# name -- the same thing the runtime does for the entry module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sorting_cv import box as _box  # noqa: E402
+from sorting_cv import camera as _camera  # noqa: E402
 
 
 class Output(TypedDict):
@@ -13,17 +22,6 @@ class Output(TypedDict):
 
 
 _POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-
-
-def _camera(observation: dict[str, Any], name: str) -> dict[str, Any]:
-    cameras = observation.get("cameras") or []
-    if isinstance(cameras, dict):
-        cameras = list(cameras.values())
-    return next(camera for camera in cameras if camera.get("name") == name)
-
-
-def _box(detection: dict[str, Any]) -> dict[str, Any]:
-    return detection.get("box") or detection.get("bbox") or detection
 
 
 def _specific_container_box(
