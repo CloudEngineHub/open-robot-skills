@@ -401,3 +401,28 @@ State details:
   — canonical scripts.
 - `prompts/vlm_select_zone.md` — VLM prompt template for the optional
   `perceive_zone` state.
+
+## Placing an object rather than a tool centre
+
+`transport_descend_linear` plans, by default, for the point between the pads:
+the carry height clears the rim by a fixed amount and the interior margin is a
+single symmetric inset. That is right when what is held is small next to the
+container and wrong when it is not -- a thick object hangs below the tool centre
+and is dragged over the dividers the thin one flies across, and a long object
+put down crosswise lands on a divider rather than in a cell.
+
+Four opt-in parameters close that gap, each defaulting to the tool-centre rule
+so no existing caller moves (checked in
+`tests/test_promotion_is_behaviour_preserving.py`):
+
+| parameter | what it buys |
+| --- | --- |
+| `target_obb` | the carry height clears the object's underside, and the interior margins keep the object -- not the tool centre -- inside the walls |
+| `carry_cap_m` | where extra height stops being free, because horizontal reach falls away above a peak |
+| `align_to_container` | turns the object's long axis onto the container's during the lift, so the turn costs no separate motion |
+| `level_lift` | lift to the full carry height before translating, so the crossing runs level instead of climbing over the dividers |
+| `nearest_first_fallbacks` | order the corner fallbacks by distance from the hand |
+
+`surface_inset_m` tells `target_obb` how far below the object's top surface the
+grasp put the tool centre; it must match whatever the grasp node used, and it is
+what turns thickness into hang.
