@@ -233,6 +233,8 @@ def run(
     max_reselects: int = 3,
     max_total_attempts: int = 40,
     settled_margin_m: float = 0.0,
+    min_box_px: float = 8.0,
+    min_box_fraction: float = 0.0,
 ) -> Output:
     """Select one unsorted object and its destination region.
 
@@ -254,6 +256,16 @@ def run(
     picked. In instance mode the node re-asks up to ``max_reselects`` times,
     telling the model which spots are spent, and calls it ``finished`` after
     ``max_total_attempts`` in total or when every visible object is exhausted.
+
+    ``min_box_px`` and ``min_box_fraction`` set the smallest box a reply may
+    give, as ``max(min_box_px, min_box_fraction * crop side)``. A flat floor is
+    a claim about pixels, and pixels are not a fixed size: on a 1280x960 frame
+    the same object covers four times the area it does at 640x480, so a floor
+    tuned for one resolution rejects real answers at the other. Measured on a
+    drawn sorting scene, a small cell read as a 15 x 50 box in the model's own
+    frame and was refused as "too small" while being exactly what was asked
+    for. The default is the flat 8 px this always used; a caller that knows its
+    frame passes a fraction instead.
 
     ``settled_margin_m`` above zero turns on the already-delivered test: an
     object whose centre lies inside a destination region is not unsorted, and a
@@ -298,6 +310,8 @@ def run(
     source_crop = image_array[crop_y:crop_y2, crop_x:crop_x2]
     # Fixed for every pass: the crop is taken once, before the loop.
     crop_h, crop_w = source_crop.shape[:2]
+    floor_w = max(float(min_box_px), float(min_box_fraction) * crop_w)
+    floor_h = max(float(min_box_px), float(min_box_fraction) * crop_h)
     # One ask per pass. In label mode there is exactly one pass, which is what
     # this always did; in instance mode a pass that lands on a spot already
     # spent re-asks with that spot named, because a deterministic model shown
@@ -370,8 +384,8 @@ def run(
                 and max(x1, x2) <= crop_w - 1.0
                 and min(y1, y2) >= 0.0
                 and max(y1, y2) <= crop_h - 1.0
-                and abs(x2 - x1) >= 8.0
-                and abs(y2 - y1) >= 8.0
+                and abs(x2 - x1) >= floor_w
+                and abs(y2 - y1) >= floor_h
             )
 
         # The prompt asks for pixels "in this cropped image" and some models
@@ -400,7 +414,7 @@ def run(
 
         bx1, bx2 = sorted((max(0.0, min(bx1, crop_w - 1.0)), max(0.0, min(bx2, crop_w - 1.0))))
         by1, by2 = sorted((max(0.0, min(by1, crop_h - 1.0)), max(0.0, min(by2, crop_h - 1.0))))
-        if bx2 - bx1 < 8.0 or by2 - by1 < 8.0:
+        if bx2 - bx1 < floor_w or by2 - by1 < floor_h:
             raise ValueError(f"VLM grasp-part box is too small: {match.group(0)!r}")
         full_box = {"x1": bx1 + crop_x, "y1": by1 + crop_y, "x2": bx2 + crop_x, "y2": by2 + crop_y}
         full_px = max(full_box["x1"], min(px + crop_x, full_box["x2"]))
