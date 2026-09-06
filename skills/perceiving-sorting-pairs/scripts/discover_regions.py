@@ -18,8 +18,9 @@ from sorting_cv import box as _box  # noqa: E402
 from sorting_cv import camera as _camera  # noqa: E402
 
 
-class Output(TypedDict):
+class Output(TypedDict, total=False):
     layout_json: str
+    attempted_json: str
 
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,20 @@ def run(
     layout_description: str,
     camera_name: str = "overhead",
     max_read_attempts: int = 1,
+    seed_attempt_log: bool = False,
 ) -> Output:
+    """Read the labelled layout from one calibrated view.
+
+    ``seed_attempt_log`` publishes an empty ``attempted_json`` beside the
+    layout. A graph that *loops* over the objects needs somewhere for that log
+    to start, and the first pass has no upstream producer for it -- the node
+    that consumes it is the node that makes it. Seeding it here makes the
+    loop-carried value visible in the workflow as an ordinary edge, instead of
+    leaving it to be resolved by whichever subgraph happened to write it last.
+
+    Off by default: a graph that does not loop should not be handed an output
+    it has no use for.
+    """
     camera = _camera(observation, camera_name)
     image = camera["rgb"]
     labels = _read_labels(ctx, image, layout_description, max_read_attempts)
@@ -187,4 +201,7 @@ def run(
         }
         for position, label in labels.items()
     ]
-    return {"layout_json": json.dumps(regions)}
+    out: Output = {"layout_json": json.dumps(regions)}
+    if seed_attempt_log:
+        out["attempted_json"] = "[]"
+    return out
