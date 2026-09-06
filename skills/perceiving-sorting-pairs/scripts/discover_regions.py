@@ -201,7 +201,12 @@ def run(
         }
         for position, label in labels.items()
     ]
-    out: Output = {"layout_json": json.dumps(regions)}
-    if seed_attempt_log:
-        out["attempted_json"] = "[]"
-    return out
+    # Always present, because gap derives a script's required output keys from
+    # every annotation on its Output TypedDict -- `total=False` is not consulted
+    # (gap.runtime.nodes._get_output_keys). A key that is sometimes absent is a
+    # node that sometimes fails, for every graph naming this bundle and not just
+    # the one that wanted the log. Empty means "no log here"; the seed is "[]".
+    return {
+        "layout_json": json.dumps(regions),
+        "attempted_json": "[]" if seed_attempt_log else "",
+    }

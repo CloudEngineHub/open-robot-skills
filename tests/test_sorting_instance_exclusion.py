@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -104,11 +103,25 @@ def _run(module, ctx, **kwargs):
     )
 
 
-def test_label_mode_publishes_no_attempt_log(select_pair):
-    """A caller that did not ask for the loop does not get a new output key."""
+def test_label_mode_publishes_an_empty_attempt_log(select_pair):
+    """The key is always there, and empty for a caller that keeps no log.
+
+    It would be tidier for a non-looping caller to see no new key at all, and
+    this test asserted exactly that until a real run said otherwise: gap derives
+    a script's required output keys from **every** annotation on its ``Output``
+    TypedDict and does not consult ``total=False``
+    (``gap.runtime.nodes._get_output_keys``). A key that is sometimes absent is
+    therefore a node that sometimes fails -- and it fails for every graph naming
+    this bundle, not only the one that wanted the log. The four-round sorting
+    graph died on `Script output missing declared key 'attempted_json'` before
+    it read a single frame.
+
+    So the contract is "always present, empty when unused" rather than "absent
+    when unused", and the emptiness is what a reader checks.
+    """
     out = _run(select_pair, _ctx([PICK]))
     assert out["status"] == "found"
-    assert "attempted_json" not in out
+    assert out["attempted_json"] == ""
 
 
 def test_instance_mode_logs_the_spot_it_picked(select_pair):

@@ -71,6 +71,9 @@ def _empty_result(status: str) -> Output:
     }
     return {
         "status": status,
+        # Every annotated Output key has to be present on every exit; see the
+        # note in _finished. A caller that keeps no log gets an empty string.
+        "attempted_json": "",
         "target_name": "",
         "target_label": "",
         "target_obb": empty_obb,
@@ -179,13 +182,14 @@ def _finished(attempts: list[dict[str, Any]] | None) -> Output:
     """The exit that says there is nothing left to pick.
 
     Carries the attempt log on when there is one. ``None`` means the caller is
-    excluding by label and has no log, and then this publishes exactly the keys
-    it always did -- a new output key is a change to what the node publishes,
-    and a caller that did not ask for the loop should not have to see one.
+    excluding by label and keeps no log, and then the log publishes empty --
+    not absent, because gap requires every annotated ``Output`` key on every
+    exit and a sometimes-absent key is a sometimes-failing node.
     """
     result = _empty_result("finished")
-    if attempts is not None:
-        result["attempted_json"] = json.dumps(attempts)
+    # Always present; see discover_regions for why an annotated key cannot be
+    # conditional. Empty is "this caller keeps no log".
+    result["attempted_json"] = json.dumps(attempts) if attempts is not None else ""
     return result
 
 
@@ -491,8 +495,7 @@ def run(
             "target_cloud": cloud,
             "destination_obb": normalized[key]["obb"],
         }
-        if by_instance:
-            found["attempted_json"] = json.dumps(attempts)
+        found["attempted_json"] = json.dumps(attempts) if by_instance else ""
         return found
     # Every pass landed on something already attempted or already delivered.
     return _finished(attempts)

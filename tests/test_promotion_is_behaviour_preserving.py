@@ -22,7 +22,6 @@ import importlib.util
 import itertools
 import json
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
