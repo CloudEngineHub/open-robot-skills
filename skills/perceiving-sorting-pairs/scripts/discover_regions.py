@@ -1,29 +1,31 @@
 """Discover a labelled 2x2 destination layout from one calibrated RGB-D view."""
 
 import json
+import logging
+import os
 import re
+import sys
 from typing import Any, TypedDict
 
 import numpy as np
 from gap import NodeContext
 
+# The runtime loads each node script standalone, so a sibling is not importable
+# by package path. Put this script's own directory on the path and import it by
+# name -- the same thing the runtime does for the entry module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sorting_cv import box as _box  # noqa: E402
+from sorting_cv import camera as _camera  # noqa: E402
 
-class Output(TypedDict):
+
+class Output(TypedDict, total=False):
     layout_json: str
+    attempted_json: str
 
+
+logger = logging.getLogger(__name__)
 
 _POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
-
-
-def _camera(observation: dict[str, Any], name: str) -> dict[str, Any]:
-    cameras = observation.get("cameras") or []
-    if isinstance(cameras, dict):
-        cameras = list(cameras.values())
-    return next(camera for camera in cameras if camera.get("name") == name)
-
-
-def _box(detection: dict[str, Any]) -> dict[str, Any]:
-    return detection.get("box") or detection.get("bbox") or detection
 
 
 def _specific_container_box(
@@ -68,25 +70,58 @@ def _specific_container_box(
     return _box(max(detections, key=lambda item: float(item.get("score", 0.0))))
 
 
-def _read_labels(ctx: NodeContext, image: Any, layout_description: str) -> dict[str, str]:
-    answer = ctx.tool(
-        "vlm.query",
-        image=image,
-        prompt=(
-            f"Locate {layout_description}. Read the printed label in each of its four "
-            "compartments. Use IMAGE coordinates, not world directions. Reply exactly: "
-            "LAYOUT: top-left=<label>; top-right=<label>; "
-            "bottom-left=<label>; bottom-right=<label>."
-        ),
-    )["text"]
-    found: dict[str, str] = {}
-    for position in _POSITIONS:
-        match = re.search(rf"{position}\s*=\s*([^;\n.]+)", str(answer), re.I)
-        if match:
-            found[position] = re.sub(r"\s+", " ", match.group(1).strip()).lower()
-    if len(found) != 4 or len(set(found.values())) != 4:
-        raise ValueError(f"could not read four unique destination labels: {answer!r}")
-    return found
+def _read_labels(
+    ctx: NodeContext, image: Any, layout_description: str, attempts: int = 1
+) -> dict[str, str]:
+    """The four printed labels, re-asking up to *attempts* times.
+
+    **Why a retry is worth having.** The failure this absorbs is not a hard one:
+    the model answers with the structure intact and simply stops before the last
+    label --
+
+        LAYOUT: top-left=SOCKET HEAD SCREW M6X60; top-right=WIRE CUTTER WALL
+        MOUNT; bottom-left=MULTIMETER; bottom-right
+
+    -- and the node then raises, the subgraph routes ambiguous, and the episode
+    aborts having done nothing. It is not a token budget (the reply is about a
+    hundred characters against a budget of a thousand tokens); it is a draw that
+    came out short, and the next draw usually does not.
+
+    It matters more the longer the labels are. A layout labelled with one or two
+    short words is read in one go; a layout labelled `socket head screw m6x60`
+    and `wire cutter wall mount` is where the read gets hard -- so the tier that
+    most needs the read to be robust was the one least tolerant of it.
+
+    **Default 1, which is the single ask this always did.** The retry is
+    something a graph asks for, because a re-ask costs a model call and only the
+    caller knows whether its labels are the hard kind. Note the asymmetry this
+    closes: `select_pair`, in the same bundle and often the same graph, has
+    always retried an unparseable reply three times.
+    """
+    answer = ""
+    for attempt in range(max(1, int(attempts))):
+        answer = ctx.tool(
+            "vlm.query",
+            image=image,
+            prompt=(
+                f"Locate {layout_description}. Read the printed label in each of its four "
+                "compartments. Use IMAGE coordinates, not world directions. Reply exactly: "
+                "LAYOUT: top-left=<label>; top-right=<label>; "
+                "bottom-left=<label>; bottom-right=<label>."
+            ),
+        )["text"]
+        found: dict[str, str] = {}
+        for position in _POSITIONS:
+            match = re.search(rf"{position}\s*=\s*([^;\n.]+)", str(answer), re.I)
+            if match:
+                found[position] = re.sub(r"\s+", " ", match.group(1).strip()).lower()
+        if len(found) == 4 and len(set(found.values())) == 4:
+            return found
+        if attempt + 1 < max(1, int(attempts)):
+            logger.warning(
+                "[discover_regions] re-asking for the layout labels: %r", answer
+            )
+    raise ValueError(f"could not read four unique destination labels: {answer!r}")
 
 
 def _region_obb(
@@ -131,10 +166,24 @@ def run(
     observation: dict[str, Any],
     layout_description: str,
     camera_name: str = "overhead",
+    max_read_attempts: int = 1,
+    seed_attempt_log: bool = False,
 ) -> Output:
+    """Read the labelled layout from one calibrated view.
+
+    ``seed_attempt_log`` publishes an empty ``attempted_json`` beside the
+    layout. A graph that *loops* over the objects needs somewhere for that log
+    to start, and the first pass has no upstream producer for it -- the node
+    that consumes it is the node that makes it. Seeding it here makes the
+    loop-carried value visible in the workflow as an ordinary edge, instead of
+    leaving it to be resolved by whichever subgraph happened to write it last.
+
+    Off by default: a graph that does not loop should not be handed an output
+    it has no use for.
+    """
     camera = _camera(observation, camera_name)
     image = camera["rgb"]
-    labels = _read_labels(ctx, image, layout_description)
+    labels = _read_labels(ctx, image, layout_description, max_read_attempts)
     detections = (
         ctx.tool(
             "grounding-dino.detect", image=image, query=layout_description, box_threshold=0.10
@@ -152,4 +201,12 @@ def run(
         }
         for position, label in labels.items()
     ]
-    return {"layout_json": json.dumps(regions)}
+    # Always present, because gap derives a script's required output keys from
+    # every annotation on its Output TypedDict -- `total=False` is not consulted
+    # (gap.runtime.nodes._get_output_keys). A key that is sometimes absent is a
+    # node that sometimes fails, for every graph naming this bundle and not just
+    # the one that wanted the log. Empty means "no log here"; the seed is "[]".
+    return {
+        "layout_json": json.dumps(regions),
+        "attempted_json": "[]" if seed_attempt_log else "",
+    }
