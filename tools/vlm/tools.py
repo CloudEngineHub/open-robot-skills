@@ -196,9 +196,16 @@ def _query_openrouter(prompt: str, images: list[np.ndarray], model: str | None) 
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": _MAX_TOKENS,
-        "temperature": 0.0,
     }
+    # GPT-5 reasoning models use the newer completion-token field and reject
+    # non-default temperature values on the Chat Completions endpoint. Keep
+    # the legacy OpenAI-compatible payload for OpenRouter and older models.
+    if model.lower().startswith("gpt-5"):
+        payload["max_completion_tokens"] = _MAX_TOKENS
+        payload["reasoning_effort"] = "low"
+    else:
+        payload["max_tokens"] = _MAX_TOKENS
+        payload["temperature"] = 0.0
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     last_exc: Exception | None = None

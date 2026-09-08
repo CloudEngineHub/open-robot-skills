@@ -31,6 +31,7 @@ from gap_core.errors import PlanningFailed, ToolError
 from gap_core.tools import tool
 from gap_core.types import (
     JointState,
+    PointCloud,
     Quaternion,
     Se3Pose,
     Trajectory,
@@ -782,4 +783,94 @@ def validate_joint_trajectory_grasped(
         "failure_reason": "" if ok else (reason or "collision"),
         "first_collision_waypoint": -1 if ok or idx is None else int(idx),
         "collision_status_detail": str(detail),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Attachment fitting
+# ---------------------------------------------------------------------------
+
+
+class AttachmentResult(TypedDict):
+    attached_object: dict[str, Any]
+
+
+def _pose_matrix(pose: Se3Pose) -> np.ndarray:
+    p, q = pose["position"], pose["rotation"]
+    w, x, y, z = (float(q[k]) for k in ("w", "x", "y", "z"))
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    out[:3, 3] = [float(p["x"]), float(p["y"]), float(p["z"])]
+    return out
+
+
+@tool(
+    name="curobo.cloud_to_attachment",
+    summary="Fit MORPHIT collision spheres to a held object's cloud, in the TCP frame, for planning with the object attached.",
+    tags=("planning",),
+)
+def cloud_to_attachment(
+    points: PointCloud,
+    tcp_pose: Se3Pose,
+    max_spheres: int = 64,
+    margin: float = 0.002,
+    surface_radius: float = 0.003,
+) -> AttachmentResult:
+    """``points`` is the object's cloud in world frame and ``tcp_pose`` the
+    TCP that holds it; the spheres come back in the TCP frame, which is what
+    ``curobo.plan_with_grasped_object`` and the validators attach. MORPHIT
+    consumes a mesh, so the cloud's convex hull stands in for the surface;
+    every radius is contracted by ``margin`` and floored at 1 mm.
+
+    This is cuRobo's sphere fitter and lives here because the CPU geometry
+    bundle cannot import it; ``geometry.cloud_to_attachment`` keeps the
+    ``surface`` and ``voxel`` fits that need no planner."""
+    cloud = np.asarray(points["points"], dtype=np.float64).reshape(-1, 3)
+    if len(cloud) < 4:
+        raise ValueError("cloud_to_attachment needs at least four points")
+    tcp_world = np.linalg.inv(_pose_matrix(tcp_pose))
+    local = (tcp_world @ np.c_[cloud, np.ones(len(cloud))].T).T[:, :3]
+    try:
+        import trimesh
+        from curobo._src.geom.sphere_fit import SphereFitType, fit_spheres_to_mesh
+    except ImportError as e:
+        raise ToolError(_INSTALL_HINT) from e
+
+    mesh = trimesh.points.PointCloud(local).convex_hull
+    with _LOCK:
+        result = fit_spheres_to_mesh(
+            mesh,
+            num_spheres=max(1, int(max_spheres)),
+            surface_radius=float(np.clip(surface_radius, 0.001, 0.010)),
+            fit_type=SphereFitType.MORPHIT,
+            iterations=200,
+            compute_metrics=True,
+        )
+    centers = result.centers.detach().cpu().numpy().reshape(-1, 3)
+    radii = result.radii.detach().cpu().numpy().reshape(-1)
+    shrink = float(max(0.0, margin))
+    radii = np.maximum(radii - shrink, 0.001)
+    valid = np.isfinite(centers).all(axis=1) & np.isfinite(radii) & (radii > 0.0)
+    if not np.any(valid):
+        raise ToolError("cuRobo MORPHIT fitting returned no attachment spheres")
+    return {
+        "attached_object": {
+            "frame": "tcp",
+            "sphere_fit_type": "morphit",
+            "sphere_radius_shrink_m": shrink,
+            "spheres": [
+                {
+                    "center": {"x": float(c[0]), "y": float(c[1]), "z": float(c[2])},
+                    "radius": float(r),
+                }
+                for c, r in zip(centers[valid], radii[valid], strict=True)
+            ],
+        }
     }

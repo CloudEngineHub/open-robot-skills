@@ -19,10 +19,10 @@ from pathlib import Path
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1]
 
-TOOL_BUNDLES = ("curobo", "geometry", "grounding-dino", "sam3")
+TOOL_BUNDLES = ("curobo", "curve", "geometry", "grounding-dino", "sam3")
 
 #: Heavy ML packages that must only load inside tool function bodies.
-_FORBIDDEN_TOP_LEVEL = {"torch", "transformers", "curobo", "sam3"}
+_FORBIDDEN_TOP_LEVEL = {"torch", "transformers", "curobo", "sam3", "skimage"}
 
 
 def test_four_tool_bundles_discovered(skills_registry):

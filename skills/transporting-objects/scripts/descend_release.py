@@ -12,6 +12,11 @@ advance the sim (it only steps when a motion or hold command is in
 flight); use ``settle_steps`` instead. The arm motions themselves
 (``robot.go_to_pose`` / ``robot.go_home``) block until the controller has
 converged, which provides the descend/retract settling.
+
+The default top-down rotation is asked of the live hand (``robot.grasp_frame``)
+and the retract names the work arm (``robot.describe_arm``), so the node is
+right on a hand whose approach axis is not tool-local +z and on a bimanual
+robot whose other arm is holding something.
 """
 
 from typing import TypedDict
@@ -30,17 +35,16 @@ def run(
     drop_rotation: Quaternion | None = None,
 ) -> Output:
     # Use the upstream-supplied drop rotation when available; fall back
-    # to the canonical top-down quaternion only when the caller didn't
-    # plumb a rotation through. Hardcoding ``_DOWN`` here forces the
-    # wrist to unspool any preserved yaw mid-descent — visible as a
-    # sudden swing that tosses the held object off-target. Pull the
-    # rotation from ``compute_drop.drop_pose.rotation`` (yaw-only by
-    # default; see ``compute_drop_pose._yaw_only_topdown``) and the
-    # descend stays purely vertical.
+    # to a top-down grasp frame only when the caller didn't plumb a
+    # rotation through. Pinning a rotation here forces the wrist to
+    # unspool any preserved yaw mid-descent — visible as a sudden swing
+    # that tosses the held object off-target. Pull the rotation from
+    # ``compute_drop.drop_pose.rotation`` (yaw-only by default; see
+    # ``compute_drop_pose._yaw_only_topdown``) and the descend stays
+    # purely vertical. The fallback is asked for rather than written out,
+    # because the literal it used to be is top-down for one hand only.
     rotation: Quaternion = (
-        drop_rotation
-        if drop_rotation is not None
-        else {"w": 0.0, "x": 1.0, "y": 0.0, "z": 0.0}
+        drop_rotation if drop_rotation is not None else ctx.tool("robot.grasp_frame")["rotation"]
     )
 
     # Descend; the motion blocks until the arm is stable, so the gripper
@@ -51,7 +55,9 @@ def run(
     # container BEFORE the arm starts retracting.
     ctx.tool("robot.open_gripper", settle_steps=60)
     # Retract slowly enough that the freshly-placed object isn't disturbed
-    # by the arm's lateral motion.
-    ctx.tool("robot.go_home")
+    # by the arm's lateral motion. This arm only: on a bimanual robot a
+    # bare go_home un-parks whatever the support arm was holding, which is
+    # why the arm is named rather than left to the runtime's default.
+    ctx.tool("robot.go_home", arm_id=int(ctx.tool("robot.describe_arm")["arm_id"]))
 
     return {"drop_position": drop_position}

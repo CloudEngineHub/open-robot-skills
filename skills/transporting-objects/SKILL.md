@@ -10,10 +10,14 @@ description: Move the currently-held object to a destination and release. The
   a sub-region described in natural language (e.g. "the left compartment of the
   caddy", "to the left of the plate", "the inside of the top drawer"), an
   optional VLM-grounded perceive_zone state localizes the zone before the drop
-  pose is computed.
+  pose is computed. Heights derive from the perceived container and the live
+  wrist pose rather than a resting tool height, and the top-down orientation
+  from the hand actually on the arm (robot.grasp_frame).
+license: Apache-2.0
 compatibility: requires gap>=0.1
 metadata: {category: motion, tags: [motion, transport, place, drop]}
 gap:
+  requires: {connector: [robot.describe_arm, robot.describe_gripper, robot.describe_workspace, robot.grasp_frame, robot.wait_steps]}
   allowed_tools:
     - robot.go_to_pose
     - robot.go_to_pose_cartesian
@@ -22,6 +26,12 @@ gap:
     - robot.get_ee_pose
     - robot.get_observation
     - robot.execute_trajectory
+    - robot.describe_arm
+    - robot.describe_gripper
+    - robot.describe_workspace
+    - robot.grasp_frame
+    - robot.wait_steps
+    - curobo.plan_to_pose
     - geometry.compute_drop_position
     - geometry.mask_to_world_points
     - geometry.filter_and_compute_obb
@@ -110,11 +120,19 @@ transport_move → release
   `container_obb = Ref("in.container_obb")`, `place_offset = -0.06` (the TCP
   descends to just above the rim so the held object clears the walls and drops
   in). It lifts, moves over the container, and does an axis-locked straight-Z
-  descend (`curobo.plan_directed_linear`, fingertip-frame). Returns
-  `place_position`.
+  descend (`curobo.plan_directed_linear`, fingertip-frame). Lift and transport
+  heights derive from the rim and the current wrist height (leave `lift_z` /
+  `transport_z` at their `-1.0` sentinels; pin them only for a workspace you
+  have measured), the wrist keeps the rotation it arrived with, every cartesian
+  leg is checked against `robot.get_ee_pose` (a leg that stops >3 cm short
+  raises), and the lateral leg searches the container's reachable interior when
+  its centre is out of reach — so `place_position` XY may differ from the
+  container centre. Returns `place_position`.
 - **`release`** — `type: script`, `scripts/<sg>/place_release.py`.
   Input `place_position = Ref("transport_move.place_position")`. Opens the
-  gripper with a settle so the object lands, then a linear straight-up retract.
+  gripper with a settle so the object lands, then a linear straight-up retract
+  to 10 cm above the placement (`hover_z` left at `-1.0`), keeping the wrist
+  rotation the transport arrived with (`robot.get_ee_pose`).
   On success → exit `placed`; on failure → `blocked`.
 
 Emit `examples/canonical_subgraph.json` verbatim for this path. Do **not** add a
@@ -139,9 +157,9 @@ perceive_zone → compute_drop → move_above → release
 ```
 
 For this path prefer the `descend_release_linear` release variant (TCP-aware
-straight Cartesian line) over `descend_release` — the latter targets the
-panda_hand link and drops the ~0.10 m TCP offset, a common source of vertical
-placement misses.
+straight Cartesian line) over `descend_release` — the latter goes through
+`robot.go_to_pose`, which on some backends targets the hand link and drops the
+hand-to-TCP offset, a common source of vertical placement misses.
 
 **Hard rule — no re-perception of the container.** Do NOT add states
 named `re_perceive_container`, `reobserve_container`, `re_observe_*`,
@@ -235,7 +253,7 @@ State details:
    **Hard rule on parameter names:** the canonical script's `def run`
    signature is `(ctx, container_obb, container_interior_obb=None,
    ee_pose_at_grasp=None, drop_clearance=0.05, approach_height=0.20,
-   held_obb=None, ...)`. Bind the held object as `held_obb`, **not**
+   held_obb=None, wrist_to_tcp=-1.0)`. Bind the held object as `held_obb`, **not**
    `target_obb`. Renaming `held_obb → target_obb` causes the runtime
    to silently drop the value (extra kwargs are warned and discarded);
    the script then falls into the no-held-geometry branch and the drop
@@ -276,8 +294,10 @@ State details:
 
    `ee_pose_at_grasp` is required for the LIBERO `In(obj, region)`
    predicate to fire after release — the script uses it to convert the
-   desired held-object Z into a TCP target accounting for the panda
-   hand-to-tcp offset. The upstream `grasping-with-planner` subgraph
+   desired held-object Z into a TCP target accounting for the hand's
+   wrist-to-TCP offset (read off `robot.describe_arm` / `robot.describe_gripper`
+   unless `wrist_to_tcp` pins it; the drop yaw is composed by
+   `robot.grasp_frame`). The upstream `grasping-with-planner` subgraph
    publishes it as a cross-subgraph output (`produces_outputs.ee_pose_at_grasp`);
    this subgraph declares `ee_pose_at_grasp` in its `required_inputs`
    so the coordinator wires the binding by name.
@@ -328,7 +348,12 @@ State details:
    `drop_y = Ref("compute_drop.drop_position.y")`
    (or `Ref("drop_offset.drop_position.x")` / `.y` when the optional
    `drop_offset` node is present). Lifts to a safe height at the current
-   XY, then moves laterally to above the drop XY.
+   XY, then moves laterally to above the drop XY. The safe height is
+   `robot.describe_workspace`'s `transport_z` unless `safe_height` pins it
+   (pin it when a held tool hangs below the fingertips and a container rim
+   sits above the work surface); when the lateral leg is out of reach it
+   retries up to three rungs 3 cm lower — never below the surface plus
+   `align_clearance_m` — and reports `flown_z` / `descents` beside `done`.
 
    **Variant — collision-aware lift/translate (`waypoint_move_carve`)**.
    Same inputs (`drop_x`, `drop_y`) and same return shape, but the node
@@ -344,8 +369,10 @@ State details:
 3. **`release`** — `type: script`, file `scripts/<sg>/descend_release.py`.
    Inputs: `drop_position = Ref("compute_drop.drop_position")`
    (or `Ref("drop_offset.drop_position")` when `drop_offset` is present).
-   Descends, opens the gripper, retracts home. On success → exit `placed`;
-   on failure → exit `blocked`.
+   Descends, opens the gripper, retracts home (`robot.go_home` on the work
+   arm named by `robot.describe_arm`; the default rotation is this hand's
+   `robot.grasp_frame`). On success → exit `placed`; on failure → exit
+   `blocked`.
 
    **Variant — linear descent (`descend_release_linear`)**. Same
    node-level contract, but the descent goes through the connector's
@@ -353,7 +380,9 @@ State details:
    `plan_to_pose` fallback built into the backend), so the held object
    descends on a straight Cartesian line with the orientation held — the
    cleanest release dynamics for subpart-grasp + place-ON tasks (frypan
-   handle → stove).
+   handle → stove). After the open it takes a 5 cm straight-up retreat at
+   the same wrist rotation and `robot.wait_steps` before `robot.go_home`,
+   so the fingers cannot drag the just-released object.
 
 ## Required end states
 
@@ -372,3 +401,28 @@ State details:
   — canonical scripts.
 - `prompts/vlm_select_zone.md` — VLM prompt template for the optional
   `perceive_zone` state.
+
+## Placing an object rather than a tool centre
+
+`transport_descend_linear` plans, by default, for the point between the pads:
+the carry height clears the rim by a fixed amount and the interior margin is a
+single symmetric inset. That is right when what is held is small next to the
+container and wrong when it is not -- a thick object hangs below the tool centre
+and is dragged over the dividers the thin one flies across, and a long object
+put down crosswise lands on a divider rather than in a cell.
+
+Four opt-in parameters close that gap, each defaulting to the tool-centre rule
+so no existing caller moves (checked in
+`tests/test_promotion_is_behaviour_preserving.py`):
+
+| parameter | what it buys |
+| --- | --- |
+| `target_obb` | the carry height clears the object's underside, and the interior margins keep the object -- not the tool centre -- inside the walls |
+| `carry_cap_m` | where extra height stops being free, because horizontal reach falls away above a peak |
+| `align_to_container` | turns the object's long axis onto the container's during the lift, so the turn costs no separate motion |
+| `level_lift` | lift to the full carry height before translating, so the crossing runs level instead of climbing over the dividers |
+| `nearest_first_fallbacks` | order the corner fallbacks by distance from the hand |
+
+`surface_inset_m` tells `target_obb` how far below the object's top surface the
+grasp put the tool centre; it must match whatever the grasp node used, and it is
+what turns thickness into hang.

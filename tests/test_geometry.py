@@ -123,6 +123,72 @@ def test_filter_noise_all_noise_returns_original(tool_registry):
     assert out["points"]["points"].shape == pts.shape
 
 
+def test_fit_planar_feature_recovers_tilted_ring(tool_registry):
+    angles = np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False)
+    center = np.array([0.42, -0.08, 0.31])
+    normal = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+    x_axis = np.cross(normal, [0.0, 0.0, 1.0])
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(normal, x_axis)
+    radius = 0.027
+    points = center + radius * (
+        np.cos(angles)[:, None] * x_axis + np.sin(angles)[:, None] * y_axis
+    )
+    out = tool_registry.invoke(
+        "geometry.fit_planar_feature",
+        points={"points": points.astype(np.float32)},
+        normal_hint={"x": float(normal[0]), "y": float(normal[1]), "z": float(normal[2])},
+        trim_fraction=0.0,
+    )
+    got_center = np.array(list(out["center"].values()))
+    got_normal = np.array(list(out["normal"].values()))
+    assert np.allclose(got_center, center, atol=1e-5)
+    assert np.dot(got_normal, normal) > 0.999
+    assert out["radius"] == pytest.approx(radius, abs=1e-5)
+    assert out["planarity"] > 0.999
+
+
+def test_fit_planar_feature_circle_center_corrects_partial_arc_bias(tool_registry):
+    center = np.array([0.42, -0.08, 0.31])
+    radius = 0.027
+    # Only one side is visible, as when fingers occlude a held wrench ring.
+    angles = np.linspace(-0.75, 0.95, 80)
+    points = center + np.column_stack(
+        (radius * np.cos(angles), radius * np.sin(angles), np.zeros(len(angles)))
+    )
+    out = tool_registry.invoke(
+        "geometry.fit_planar_feature",
+        points={"points": points.astype(np.float32)},
+        normal_hint={"x": 0.0, "y": 0.0, "z": 1.0},
+        fit_circle_center=True,
+    )
+    got_center = np.array(list(out["center"].values()))
+    assert np.allclose(got_center, center, atol=2e-4)
+    assert out["radius"] == pytest.approx(radius, abs=2e-4)
+
+
+def test_fit_linear_feature_recovers_hook_axis_and_endpoints(tool_registry):
+    axis = np.array([-1.0, 0.2, 0.1])
+    axis /= np.linalg.norm(axis)
+    center = np.array([0.8, 0.0, 1.1])
+    distances = np.linspace(-0.04, 0.04, 81)
+    points = center + distances[:, None] * axis
+    out = tool_registry.invoke(
+        "geometry.fit_linear_feature",
+        points={"points": points.astype(np.float32)},
+        axis_hint={"x": -1.0, "y": 0.0, "z": 0.0},
+        trim_fraction=0.0,
+    )
+    got_axis = np.array(list(out["axis"].values()))
+    end_min = np.array(list(out["endpoint_min"].values()))
+    end_max = np.array(list(out["endpoint_max"].values()))
+    assert np.dot(got_axis, axis) > 0.999
+    assert np.allclose(end_min, center - 0.04 * axis, atol=1e-5)
+    assert np.allclose(end_max, center + 0.04 * axis, atol=1e-5)
+    assert out["length"] == pytest.approx(0.08, abs=1e-5)
+    assert out["linearity"] > 0.999
+
+
 # ---------------------------------------------------------------------------
 # grasp candidates
 # ---------------------------------------------------------------------------
@@ -257,3 +323,66 @@ def test_xy_distance_ignores_z(tool_registry):
         point_b={"x": 3.0, "y": 4.0, "z": -5.0},
     )
     assert out["distance"] == pytest.approx(5.0)
+
+
+def test_world_clustering_preserves_multiple_disconnected_surfaces():
+    from gap_skills.tools.geometry import _impl
+
+    rng = np.random.default_rng(4)
+    table = np.column_stack([
+        rng.uniform(-0.4, 0.4, 500),
+        rng.uniform(-0.3, 0.3, 500),
+        np.full(500, 0.73),
+    ])
+    board = np.column_stack([
+        np.full(300, 0.9),
+        rng.uniform(-0.3, 0.3, 300),
+        rng.uniform(0.75, 1.25, 300),
+    ])
+    clusters = _impl._significant_clusters(
+        np.concatenate([table, board]), eps=0.09, min_samples=4
+    )
+    assert len(clusters) == 2
+    assert sum(len(cluster) for cluster in clusters) == 800
+
+
+@pytest.mark.parametrize("normal_axis", [0, 2])
+def test_planar_work_surfaces_become_closed_collision_slabs(normal_axis):
+    from gap_skills.tools.geometry import _impl
+
+    a, b = np.meshgrid(np.linspace(-0.4, 0.4, 15), np.linspace(-0.3, 0.3, 12))
+    points = np.zeros((a.size, 3))
+    tangent = [axis for axis in range(3) if axis != normal_axis]
+    points[:, tangent[0]] = a.ravel()
+    points[:, tangent[1]] = b.ravel()
+    points[:, normal_axis] = 0.73
+    mesh = _impl._planar_slab_mesh(points, thickness=0.008)
+    assert mesh is not None
+    vertices, faces = mesh
+    assert len(vertices) >= 8
+    assert len(faces) >= 12
+    assert np.ptp(vertices[:, normal_axis]) == pytest.approx(0.008, abs=1e-5)
+
+
+def test_plane_extraction_separates_touching_table_and_board():
+    from gap_skills.tools.geometry import _impl
+
+    # The surfaces share the line x=0.8, z=0.73, so DBSCAN intentionally sees
+    # one connected component. Plane extraction must still separate them.
+    x, y = np.meshgrid(np.linspace(0.3, 0.8, 28), np.linspace(-0.4, 0.4, 32))
+    table = np.column_stack([x.ravel(), y.ravel(), np.full(x.size, 0.73)])
+    z, by = np.meshgrid(np.linspace(0.73, 1.3, 30), np.linspace(-0.4, 0.4, 32))
+    board = np.column_stack([np.full(z.size, 0.8), by.ravel(), z.ravel()])
+
+    planes, residual = _impl._extract_planar_surfaces(
+        np.concatenate([table, board]), distance_threshold=0.004
+    )
+
+    assert len(planes) == 2
+    normals = []
+    for plane in planes:
+        _, _, vh = np.linalg.svd(plane - np.median(plane, axis=0), full_matrices=False)
+        normals.append(np.abs(vh[-1]))
+    assert any(normal[2] > 0.99 for normal in normals)
+    assert any(normal[0] > 0.99 for normal in normals)
+    assert len(residual) < 0.05 * (len(table) + len(board))
