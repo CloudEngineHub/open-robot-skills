@@ -330,6 +330,7 @@ def track_centerline(
     vis_floor: float = TRACK_VIS_FLOOR,
     iters: int = TRACK_ITERS,
     stiffness: float = TRACK_STIFFNESS,
+    radius: float | None = None,
 ) -> dict[str, Any]:
     """Advance a known centreline onto a new frame. TrackDLO's idea, compactly.
 
@@ -373,8 +374,28 @@ def track_centerline(
     # camera each pass -- the same surface-vs-axis bias :func:`_to_axis`
     # documents, applied repeatedly rather than once. Corrected on the way in so
     # the correspondence is axis-to-axis.
+    #
+    # THE RADIUS TO CORRECT BY IS THE ONE THE OPENING SURVEY MEASURED, not this
+    # frame's. :func:`_cloud_radius` is area over length, and on a tracking
+    # frame both of its terms are wrong in the same direction: a mask that
+    # caught a fingertip, a bench highlight or the arm's own shadow gains area,
+    # while an occluded rod loses the length that area is divided by. Measured
+    # on a saved carry frame that ratio returned 23.15 mm against the opening
+    # camera's 3.47 mm, on a rod whose radius is a constant of the scene -- and
+    # :func:`_to_axis` then pushed every node 23 mm along its view ray, putting
+    # the reconstructed cable through the bench it is lying on. A rod does not
+    # change radius during an episode, so the opening measurement is the better
+    # estimator on every later frame and a caller that has one should pass it.
+    #
+    # ``None`` keeps the per-frame estimate, so a caller that never surveyed --
+    # which is every caller that existed before this argument -- does not move.
     if len(X):
-        X = _to_axis(X, T, _cloud_radius(mask, depth, K, _arclength(Y)))
+        skin = (
+            float(radius)
+            if radius is not None and float(radius) > 0.0
+            else _cloud_radius(mask, depth, K, _arclength(Y))
+        )
+        X = _to_axis(X, T, skin)
     if len(X) < 8:
         return {
             "points": [[float(v) for v in p] for p in Y],

@@ -89,6 +89,7 @@ def track_centerline(
     depth: np.ndarray,
     intrinsics: np.ndarray,
     camera_pose: Se3Pose | np.ndarray,
+    radius: float | None = None,
 ) -> Centerline:
     """Move the nodes of ``prior`` (the ``points`` of an earlier fit or track:
     ``[[x, y, z], ...]`` in world metres; a whole ``Centerline`` dict is
@@ -101,6 +102,16 @@ def track_centerline(
     Returns a :class:`~gap_core.types.Centerline` with ``visibility`` (per
     node, 0..1 -- route on it) and ``tracked: True``. A prior of fewer than
     three points falls back to a cold ``fit_centerline`` (no ``visibility``).
+
+    ``radius`` is the OPENING SURVEY's rod radius in metres, and a caller that
+    has one should pass it. The observation is a cloud on the rod's skin and the
+    model is its axis, so the cloud is corrected inward by one radius before the
+    correspondence -- and estimating that radius from the tracking frame itself
+    is unreliable in exactly the situation tracking exists for: on a saved carry
+    frame the per-frame estimate read 23.15 mm against the opening camera's
+    3.47 mm, which pushed the whole cable 23 mm along its view ray and through
+    the bench. Left ``None`` the per-frame estimate is used, which is what every
+    caller predating this argument gets.
     """
     if prior is None or mask is None or depth is None or intrinsics is None or camera_pose is None:
         raise ValueError(
@@ -116,4 +127,5 @@ def track_centerline(
         np.asarray(depth, dtype=np.float64),
         np.asarray(intrinsics, dtype=np.float64),
         _camera_matrix(camera_pose),
+        radius=None if radius is None else float(radius),
     )
