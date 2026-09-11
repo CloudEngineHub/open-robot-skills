@@ -29,6 +29,7 @@
         "./skills/perceiving-object-parts",
         "./skills/perceiving-objects",
         "./skills/perceiving-objects-oneshot",
+        "./skills/perceiving-relational-correspondences",
         "./skills/perceiving-routing-fixtures",
         "./skills/perceiving-sorting-pairs",
         "./skills/placing-held-feature",
