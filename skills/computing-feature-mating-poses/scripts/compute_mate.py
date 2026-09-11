@@ -23,7 +23,16 @@ def _move_loop_poses_to_shaft_interior(
     fixture_radius: float,
     crossing_lift_m: float = 0.0,
 ) -> None:
-    """Ensure loop poses reach, but do not overshoot, shaft-interior depths."""
+    """Ensure loop poses reach, but do not overshoot, shaft-interior depths.
+
+    ``fixture_feature["mating_profile"]`` is an optional per-object-kind table
+    the calling graph may attach: ``settling_axis`` (default world +z),
+    ``crossing_offsets_m`` per pose name, ``seated_radial_offset_m`` and
+    ``mate_settling_offset_m``. Every key is optional and an absent key leaves
+    the pose exactly where the geometry alone puts it; ``crossing_lift_m`` is
+    the older, single-number form of the same correction and still applies
+    along world +z on its own.
+    """
     usable_length = max(0.0, float(fixture_feature.get("usable_length", 0.0)))
     if usable_length <= 0.0:
         return
@@ -44,6 +53,9 @@ def _move_loop_poses_to_shaft_interior(
     fixture_position = fixture_feature["pose"]["position"]
     tip = [float(fixture_position[key]) for key in ("x", "y", "z")]
     outward_axis = [float(axis[key]) for key in ("x", "y", "z")]
+    profile = dict(fixture_feature.get("mating_profile") or {})
+    settling_axis = [float(v) for v in profile.get("settling_axis", [0.0, 0.0, 1.0])]
+    crossing_offsets = dict(profile.get("crossing_offsets_m") or {})
 
     def feature_world_and_position(pose_name: str):
         pose = result[pose_name]
@@ -79,6 +91,12 @@ def _move_loop_poses_to_shaft_interior(
         # lower it onto the shaft.
         if crossing_lift_m:
             position["z"] = float(position["z"]) + float(crossing_lift_m)
+        # The profile's per-pose form of the same correction, along its own
+        # settling axis, for a kind whose settle is not vertical.
+        compensation = float(crossing_offsets.get(pose_name, 0.0))
+        if compensation:
+            for index, key in enumerate(("x", "y", "z")):
+                position[key] = float(position[key]) + compensation * settling_axis[index]
 
     # Once inside, lower the loop until the shaft approaches its inner rim,
     # retaining a small geometric clearance for the local contact motion.
@@ -87,11 +105,16 @@ def _move_loop_poses_to_shaft_interior(
     axial = sum(relative[index] * outward_axis[index] for index in range(3))
     transverse = [relative[index] - axial * outward_axis[index] for index in range(3)]
     transverse_norm = sum(value * value for value in transverse) ** 0.5
-    seated_offset = max(0.0, held_radius - fixture_radius - 0.001)
+    default_seated_offset = max(0.0, held_radius - fixture_radius - 0.001)
+    seated_offset = float(profile.get("seated_radial_offset_m", default_seated_offset))
     if transverse_norm > 1e-9:
         desired = [value * seated_offset / transverse_norm for value in transverse]
         for index, key in enumerate(("x", "y", "z")):
             position[key] = float(position[key]) + desired[index] - transverse[index]
+    mate_offset = float(profile.get("mate_settling_offset_m", 0.0))
+    if mate_offset:
+        for index, key in enumerate(("x", "y", "z")):
+            position[key] = float(position[key]) + mate_offset * settling_axis[index]
 
     for pose_name, requested_depth in (("engaged_pose", engaged_depth), ("mate_pose", mate_depth)):
         feature_world, position = feature_world_and_position(pose_name)
@@ -110,7 +133,14 @@ def run(
     relation: str,
     attached_object: dict[str, Any],
     crossing_lift_m: float = 0.0,
+    arm_id: int | None = None,
 ) -> Output:
+    # An arm is only ever NAMED, never assumed: threaded as an absent keyword
+    # when unset, so a single-arm graph's recorded calls do not change.
+    if arm_id is None:
+        carried = attached_object.get("arm_id") if isinstance(attached_object, dict) else None
+        arm_id = None if carried is None else int(carried)
+    on_arm: dict[str, Any] = {} if arm_id is None else {"arm_id": int(arm_id)}
     axis = fixture_feature.get("axis")
     if not axis:
         raise ValueError("fixture feature has no directed axis")
@@ -131,7 +161,7 @@ def run(
         }
     elif relation == "loop_over_shaft":
         dimensions = {"seating_margin": float(fixture_feature.get("seating_margin", 0.0))}
-    reference_pose = ctx.tool("robot.get_ee_pose")["pose"]
+    reference_pose = ctx.tool("robot.get_ee_pose", **on_arm)["pose"]
     result = ctx.tool(
         "geometry.compute_feature_mate",
         held_feature_in_tcp=held_feature_in_tcp,
