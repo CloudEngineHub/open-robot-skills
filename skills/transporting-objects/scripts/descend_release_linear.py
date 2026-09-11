@@ -43,9 +43,15 @@ Inputs:
   descend_release.
 - ``drop_rotation`` (Quaternion, optional): TCP orientation held through
   the descent. Defaults to this hand's top-down grasp frame.
+- ``arm_id`` (int, optional): the arm to drive on a bimanual cell. Left
+  unset, every robot call is made WITHOUT an ``arm_id`` keyword — not with
+  ``arm_id=0`` — because ``ctx.tool("robot.open_gripper")`` and
+  ``ctx.tool("robot.open_gripper", arm_id=0)`` are two different recorded
+  calls, and the promotion-parity gate compares names and keyword values.
+  Single-arm graphs replay byte-identically; a bimanual one passes a hand.
 """
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from gap import NodeContext
 from gap_core.types import Quaternion, Se3Pose, Vec3
@@ -59,28 +65,32 @@ def run(
     ctx: NodeContext,
     drop_position: Vec3,
     drop_rotation: Quaternion | None = None,
+    arm_id: int | None = None,
 ) -> Output:
+    on_arm: dict[str, Any] = {} if arm_id is None else {"arm_id": int(arm_id)}
     # Straight down for *this* hand, not for a hand whose approach axis happens
     # to be its tool-local +z. `robot.grasp_frame` with no arguments composes it
     # from the live hand's measured axes.
     rotation = (
-        drop_rotation if drop_rotation is not None else ctx.tool("robot.grasp_frame")["rotation"]
+        drop_rotation
+        if drop_rotation is not None
+        else ctx.tool("robot.grasp_frame", **on_arm)["rotation"]
     )
     end_pose: Se3Pose = {"position": drop_position, "rotation": rotation}
-    ctx.tool("robot.go_to_pose_cartesian", pose=end_pose)
+    ctx.tool("robot.go_to_pose_cartesian", pose=end_pose, **on_arm)
     # Open + settle long enough for the object to land before anything moves.
-    ctx.tool("robot.open_gripper", settle_steps=60)
+    ctx.tool("robot.open_gripper", settle_steps=60, **on_arm)
     # Clear the released object and container before the large return-home
     # motion. Preserve the wrist orientation and use one short Cartesian IK
     # retreat so the fingers cannot strike or drag the newly released object.
-    current = ctx.tool("robot.get_ee_pose")["pose"]
+    current = ctx.tool("robot.get_ee_pose", **on_arm)["pose"]
     retreat_position = dict(current["position"])
     retreat_position["z"] = float(retreat_position["z"]) + 0.05
     retreat_pose: Se3Pose = {
         "position": retreat_position,
         "rotation": dict(current["rotation"]),
     }
-    ctx.tool("robot.go_to_pose_cartesian", pose=retreat_pose)
+    ctx.tool("robot.go_to_pose_cartesian", pose=retreat_pose, **on_arm)
     ctx.tool("robot.wait_steps", steps=12)
     ctx.tool("robot.go_home")
     return {"drop_position": drop_position}
