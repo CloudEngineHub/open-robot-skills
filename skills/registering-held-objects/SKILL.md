@@ -7,7 +7,7 @@ metadata: {category: perception, tags: [in-hand, registration, wrist-camera, col
 gap:
   allowed_tools: [robot.get_ee_pose, sam3.segment_text, geometry.mask_to_world_points, geometry.fit_planar_feature, curobo.cloud_to_attachment, geometry.cloud_to_attachment]
   required_inputs: {reference_cloud: PointCloud, functional_feature: FunctionalFeature, object_description: string}
-  produces_outputs: {feature_in_tcp: Se3Pose, object_in_tcp: Se3Pose, attached_object: AttachedObject, registration_confidence: float}
+  produces_outputs: {feature_in_tcp: Se3Pose, object_in_tcp: Se3Pose, attached_object: AttachedObject, registration_confidence: float, registration_method: string, fallback_used: bool, translation_uncertainty_m: float}
   exit_conditions:
     registered: A feature-in-TCP transform and attachment were produced; registration_confidence is the accepted mask score, or 0.25 when the grasp-time or prior transform was retained.
     lost: Registration raised — no cloud could be fitted into an attachment or a geometry fit failed, so the object is no longer localized.

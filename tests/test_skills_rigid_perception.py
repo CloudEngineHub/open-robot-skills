@@ -63,16 +63,19 @@ def _obb(center=(0.0, 0.0, 0.0), extent=(0.03, 0.01, 0.01)) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_functional_features_declares_five_scripts_and_two_exits(skills_registry):
+def test_functional_features_declares_six_scripts_and_two_exits(skills_registry):
     info = skills_registry.get("perceiving-functional-features")
     assert info.kind == "skill"
     assert set(info.meta.exit_conditions) == {"found", "not_found"}
+    # Six since the tool-hanging fold (2026-09-11): `perceive_fixture_feature`
+    # is the profile-declared fixture side of `perceive_object_feature`.
     assert set(info.canonical_scripts) == {
         "perceive_feature",
         "perceive_object_feature",
         "perceive_protruding_shaft",
         "perceive_directed_tip",
         "perceive_aperture",
+        "perceive_fixture_feature",
     }
     assert set(info.meta.allowed_tools) == {
         "sam3.segment_text",

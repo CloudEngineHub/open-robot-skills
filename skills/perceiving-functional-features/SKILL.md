@@ -22,6 +22,7 @@ gap:
     - perceive_protruding_shaft: scripts/perceive_protruding_shaft.py
     - perceive_directed_tip: scripts/perceive_directed_tip.py
     - perceive_aperture: scripts/perceive_aperture.py
+    - perceive_fixture_feature: scripts/perceive_fixture_feature.py
   streaming: false
 ---
 
