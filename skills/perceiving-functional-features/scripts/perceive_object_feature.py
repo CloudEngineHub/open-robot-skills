@@ -32,7 +32,7 @@ objects workable. Precedence when both are given: ``feature_profiles``.
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import numpy as np
 from gap import NodeContext
@@ -55,6 +55,9 @@ class Output(TypedDict):
     feature_center: dict[str, float]
     feature_pose: dict[str, Any]
     functional_feature: dict[str, Any]
+    #: Only when the selected ``feature_profiles`` row names the mating relation
+    #: (the ``candidates`` path returns no relation, as before).
+    relation: NotRequired[str]
 
 
 def _camera(observation: dict[str, Any], name: str) -> dict[str, Any]:
