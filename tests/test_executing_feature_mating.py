@@ -72,7 +72,9 @@ def test_small_correction_is_servoed_then_reached_waypoint_is_skipped(scripts):
     assert ctx.calls[1].kwargs == {"pose": _pose(0.5)}
     assert ctx.call_count("motion.plan_to_pose") == 0
     assert ctx.call_count("robot.execute_trajectory") == 0
-    assert out == {"final_pose": _pose(0.4)}
+    assert out["final_pose"] == _pose(0.4)
+    assert set(out) == {"final_pose", "waypoint_count", "waypoint_reports", "fallback_count", "registration_uncertainty_m"}
+    assert out["fallback_count"] == 1  # the 5 mm correction was servoed, not planned
 
 
 def test_reached_gate_is_millimetre_tight(scripts):
@@ -213,7 +215,10 @@ def test_release_retreats_along_axis_by_attached_extent(scripts):
         attached_object=attached,
         relation="loop_over_shaft",
     )
-    assert out == {"released": True}
+    # The call sequence is the contract; the outputs may GROW (declared in
+    # the script's Output) but every key must be one it declares.
+    assert out["released"] is True
+    assert set(out) == {"released", "retreat_pose", "release_report"}
     assert [call.tool for call in ctx.calls] == [
         "robot.open_gripper",
         "robot.go_to_pose_cartesian",

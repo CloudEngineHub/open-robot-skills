@@ -13,6 +13,17 @@ approach tube along a fixture axis ending at its tip, and a vertical corridor
 through an aperture in a lid. Nearly zero-thickness depth-edge slivers and
 unmistakable invalid-depth sheets are dropped because a collision checker
 treats each one as exact occupied volume.
+
+**The collision profile.** A graph that carries one profile per object kind
+passes ``collision_profiles`` (keyed by ``source_kind``) and ``target_kind``.
+A profile may switch the whole thing off (``strategy: disabled`` -- an empty
+world, for an executor that has declared it will not consult one), name the
+reference camera and the exclusion queries and thresholds, override the
+reconstruction and artifact-filter constants, append declared keep-out boxes,
+and drive the approach-tube carve from its own ``approach_corridor`` block.
+Every profile key is optional and an absent key leaves the constant below in
+force, so a graph that passes no profile gets exactly the world and the calls
+it always got.
 """
 
 from typing import Any, TypedDict
@@ -24,29 +35,45 @@ from gap import NodeContext
 class Output(TypedDict):
     world_config: dict[str, Any]
     mesh_names: list[str]
+    removed_mesh_names: list[str]
+    strategy: str
 
 
-def _visible_robot_mask(ctx: NodeContext, camera: dict[str, Any]) -> np.ndarray | None:
+def _semantic_mask(
+    ctx: NodeContext, camera: dict[str, Any], query: str, threshold: float, max_results: int = 2
+) -> np.ndarray | None:
+    """The best-scoring mask for *query* at or above *threshold*, or ``None``."""
+    result = ctx.tool("sam3.segment_text", image=camera["rgb"], query=query, max_results=max_results)
+    candidates = [
+        (float(score), np.asarray(mask) > 0)
+        for mask, score in zip(result.get("masks") or [], result.get("scores") or [], strict=False)
+        if float(score) >= threshold
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1].astype(np.uint8) * 255
+
+
+def _visible_robot_mask(
+    ctx: NodeContext, camera: dict[str, Any], queries: list[str], threshold: float
+) -> np.ndarray | None:
     """Segment robot pixels so the depth reconstruction is not self-obstacle."""
-    image = camera["rgb"]
     merged = None
-    for query in ("robot arm", "robot gripper"):
-        result = ctx.tool("sam3.segment_text", image=image, query=query, max_results=2)
-        for mask, score in zip(result.get("masks") or [], result.get("scores") or [], strict=False):
-            if float(score) < 0.10:
-                continue
-            candidate = np.asarray(mask) > 0
+    for query in queries:
+        mask = _semantic_mask(ctx, camera, str(query), threshold)
+        if mask is not None:
+            candidate = mask > 0
             merged = candidate if merged is None else merged | candidate
     return None if merged is None else merged.astype(np.uint8) * 255
 
 
 def _visible_target_mask(
-    ctx: NodeContext, camera: dict[str, Any], description: str
+    ctx: NodeContext, camera: dict[str, Any], description: str, threshold: float
 ) -> np.ndarray | None:
     """Exclude the future attachment from every reconstructed camera view."""
     result = ctx.tool("sam3.segment_text", image=camera["rgb"], query=description, max_results=2)
     masks, scores = result.get("masks") or [], result.get("scores") or []
-    if not masks or not scores or float(scores[0]) < 0.08:
+    if not masks or not scores or float(scores[0]) < threshold:
         return None
     return (np.asarray(masks[0]) > 0).astype(np.uint8) * 255
 
@@ -61,12 +88,12 @@ def _origin_triangle_distance_2d(triangle: np.ndarray) -> float:
     signs = [cross(b - a, -a), cross(c - b, -b), cross(a - c, -c)]
     if all(value >= -1.0e-9 for value in signs) or all(value <= 1.0e-9 for value in signs):
         return 0.0
-    distances = []
-    for start, end in ((a, b), (b, c), (c, a)):
-        edge = end - start
-        t = float(np.clip(-(start @ edge) / max(float(edge @ edge), 1.0e-12), 0.0, 1.0))
-        distances.append(float(np.linalg.norm(start + t * edge)))
-    return min(distances)
+    origin = np.zeros(2)
+    return min(
+        _distance_to_segment_xy(origin, a, b),
+        _distance_to_segment_xy(origin, b, c),
+        _distance_to_segment_xy(origin, c, a),
+    )
 
 
 def _distance_to_segment_xy(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
@@ -86,7 +113,7 @@ def _point_in_triangle_xy(point: np.ndarray, triangle: np.ndarray) -> bool:
         return False
     u = float((dot11 * dot02 - dot01 * dot12) / denominator)
     v = float((dot00 * dot12 - dot01 * dot02) / denominator)
-    return u >= -1.0e-8 and v >= -1.0e-8 and u + v <= 1.0 + 1.0e-8
+    return u >= -1.0e-9 and v >= -1.0e-9 and u + v <= 1.0 + 1.0e-9
 
 
 def _mesh_arrays(mesh: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -112,9 +139,19 @@ def _keep_faces(
 
 
 def _carve_approach_tube(
-    meshes: list[dict[str, Any]], tip: np.ndarray, outward: np.ndarray
+    meshes: list[dict[str, Any]],
+    tip: np.ndarray,
+    outward: np.ndarray,
+    *,
+    axial_min: float = -0.012,
+    axial_max: float = 0.25,
+    radius: float = 0.055,
 ) -> list[dict[str, Any]]:
-    """Remove faces inside a narrow tube along ``outward`` ending at ``tip``."""
+    """Remove faces inside a narrow tube along ``outward`` ending at ``tip``.
+
+    The 55 mm default admits the gripper collision envelope at the intentional
+    mate while retaining nearby fixture geometry.
+    """
     reference = np.array([1.0, 0.0, 0.0])
     if abs(float(reference @ outward)) > 0.9:
         reference = np.array([0.0, 1.0, 0.0])
@@ -133,10 +170,8 @@ def _carve_approach_tube(
         keep = []
         for face in faces:
             face_axial = axial[face]
-            overlaps = float(face_axial.max()) >= -0.012 and float(face_axial.min()) <= 0.25
-            # 55 mm admits the gripper collision envelope at the intentional
-            # mate while retaining nearby fixture geometry.
-            intersects = overlaps and _origin_triangle_distance_2d(projected[face]) <= 0.055
+            overlaps = float(face_axial.max()) >= axial_min and float(face_axial.min()) <= axial_max
+            intersects = overlaps and _origin_triangle_distance_2d(projected[face]) <= radius
             keep.append(not intersects)
         updated = _keep_faces(mesh, vertices, faces, keep)
         if updated is not None:
@@ -176,6 +211,32 @@ def _carve_corridor(
     return carved
 
 
+def _keep_out_boxes(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Declared axis-aligned keep-out boxes as planner mesh geometry."""
+    boxes = list((profile.get("fixture_keep_out") or {}).get("boxes") or [])
+    if not boxes:
+        return []
+    signs = np.array([
+        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+        [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+    ], dtype=np.float64)
+    faces = np.array([
+        [0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6],
+        [0, 4, 5], [0, 5, 1], [1, 5, 6], [1, 6, 2],
+        [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0],
+    ], dtype=np.int32)
+    allowed = set(profile.get("allowed_contact_surfaces") or [])
+    out = []
+    for index, box in enumerate(boxes):
+        name = str(box.get("name", f"fixture_keep_out_{index}"))
+        if name in allowed:
+            continue
+        center = np.array([float(box["center"][key]) for key in ("x", "y", "z")])
+        half = 0.5 * np.array([float(box["size"][key]) for key in ("x", "y", "z")])
+        out.append({"name": name, "vertices": (center + signs * half).astype(np.float32), "faces": faces.copy()})
+    return out
+
+
 def _pack(meshes: list[dict[str, Any]]) -> dict[str, Any]:
     """One indexed mesh from many components, without bridging triangles."""
     all_vertices, all_faces, offset = [], [], 0
@@ -200,6 +261,15 @@ def _vec(value: dict[str, float]) -> np.ndarray:
     return np.array([value[k] for k in ("x", "y", "z")], dtype=np.float64)
 
 
+def _select_profile(target_kind: str, collision_profiles: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not collision_profiles:
+        return {}
+    profiles = {str(item["source_kind"]): item for item in collision_profiles}
+    if target_kind not in profiles:
+        raise ValueError(f"no collision profile declared for {target_kind!r}")
+    return dict(profiles[target_kind])
+
+
 def run(
     ctx: NodeContext,
     observation: dict[str, Any],
@@ -218,6 +288,9 @@ def run(
     pack_meshes: bool = False,
     sheet_floor_z: float = 0.30,
     sheet_max_extent_m: float = 2.0,
+    target_kind: str = "",
+    collision_profiles: list[dict[str, Any]] | None = None,
+    robot_spheres: list[dict[str, Any]] | None = None,
 ) -> Output:
     """Build the world from the selected views and carve the goal's free space.
 
@@ -231,7 +304,28 @@ def run(
     with a positive ``corridor_radius``, between ``corridor_rim_z - 35 mm``
     and ``+180 mm``. ``sheet_floor_z``/``sheet_max_extent_m`` drop components
     lying entirely below or spanning more than the workcell (0 disables).
+
+    ``collision_profiles`` + ``target_kind`` select a profile (see the module
+    docstring); ``robot_spheres`` supplies the robot's collision spheres when
+    the caller already has them, instead of asking the planner.
     """
+    profile = _select_profile(target_kind, collision_profiles)
+    strategy = str(profile.get("strategy", "rgbd_mesh"))
+    if strategy == "disabled":
+        return {"world_config": {"meshes": []}, "mesh_names": [], "removed_mesh_names": [], "strategy": strategy}
+    if strategy != "rgbd_mesh":
+        raise ValueError(f"unsupported collision-world strategy {strategy!r}")
+    exclusions = profile.get("excluded_masks") or {}
+    reconstruction = profile.get("reconstruction") or {}
+    filters = profile.get("obstacle_filter") or {}
+    keep_out = profile.get("fixture_keep_out") or {}
+    corridor = profile.get("approach_corridor") or {}
+    allowed_surfaces = set(profile.get("allowed_contact_surfaces") or [])
+    if "reference_camera" in profile:
+        mask_camera_name = str(profile["reference_camera"])
+    if not target_description and exclusions.get("cross_view_target", False) and target_kind:
+        target_description = str(exclusions.get("target_query", target_kind))
+
     all_cameras = list(observation.get("cameras") or [])
     if isinstance(observation.get("cameras"), dict):
         all_cameras = list(observation["cameras"].values())
@@ -239,110 +333,112 @@ def run(
     cameras = [c for c in all_cameras if not selected or c.get("name") in selected]
     if not cameras:
         raise ValueError("collision reconstruction requires RGB-D cameras")
-
     object_masks: list[dict[str, Any]] = []
     for index, camera in enumerate(cameras):
         if camera.get("name") == mask_camera_name:
-            object_masks.append(
-                {"name": "grasp_target", "mask": target_mask, "camera_index": index}
-            )
-            if fixture_mask is not None:
+            if exclusions.get("target", True):
+                object_masks.append({"name": "grasp_target", "mask": target_mask, "camera_index": index})
+            # A fixture mask is excluded as before; a profile may also say the
+            # fixture is an allowed contact surface, which means the same thing.
+            if fixture_mask is not None and (not profile or "fixture_mask" in allowed_surfaces):
                 contact_mask = np.asarray(fixture_mask, dtype=np.uint8)
                 # Some geometric fixture detectors return a full-frame mask as
                 # a placeholder. Excluding that would erase the entire world.
-                if (
-                    contact_mask.shape == camera["depth"].shape
-                    and float(np.mean(contact_mask > 0)) < 0.5
-                ):
-                    object_masks.append(
-                        {"name": "contact_fixture", "mask": contact_mask, "camera_index": index}
-                    )
-        elif target_description:
+                if contact_mask.shape == camera["depth"].shape and float(np.mean(contact_mask > 0)) < 0.5:
+                    object_masks.append({"name": "contact_fixture", "mask": contact_mask, "camera_index": index})
+        elif target_description and exclusions.get("cross_view_target", True):
             # Reconstruction happens before grasping. If the target is
             # removed only from one view, its returns in the others become a
             # static obstacle exactly where the attached object later rotates.
-            target_view = _visible_target_mask(ctx, camera, target_description)
-            if target_view is not None:
-                object_masks.append(
-                    {
-                        "name": f"grasp_target_view_{index}",
-                        "mask": target_view,
-                        "camera_index": index,
-                    }
-                )
-        robot_mask = _visible_robot_mask(ctx, camera)
-        if robot_mask is not None:
-            object_masks.append(
-                {"name": f"robot_view_{index}", "mask": robot_mask, "camera_index": index}
+            target_view = _visible_target_mask(
+                ctx, camera, target_description, float(exclusions.get("target_score_min", 0.08))
             )
-
-    # Capture robot geometry with the same observation. Unlike a segmentation
-    # mask, this includes occluded and visually ambiguous links and remains
-    # aligned with the arm pixels even after the robot subsequently moves.
-    robot_spheres: list[dict[str, Any]] = []
-    try:
-        sphere_result = ctx.tool("motion.get_robot_collision_spheres", arm_id=-1)
-        robot_spheres = list(sphere_result.get("spheres") or [])
-    except Exception:
-        # Portable to robots without a model-backed planner; their visual
-        # masks still provide the established fallback.
-        robot_spheres = []
-
+            if target_view is not None:
+                object_masks.append({"name": f"grasp_target_view_{index}", "mask": target_view, "camera_index": index})
+        if exclusions.get("robot", True):
+            robot_mask = _visible_robot_mask(
+                ctx, camera,
+                list(exclusions.get("robot_queries") or ["robot arm", "robot gripper"]),
+                float(exclusions.get("robot_score_min", 0.10)),
+            )
+            if robot_mask is not None:
+                object_masks.append({"name": f"robot_view_{index}", "mask": robot_mask, "camera_index": index})
+    if robot_spheres is None:
+        # Capture robot geometry with the same observation. Unlike a
+        # segmentation mask, this includes occluded and visually ambiguous
+        # links and remains aligned with the arm pixels even after the robot
+        # subsequently moves.
+        try:
+            sphere_result = ctx.tool("motion.get_robot_collision_spheres", arm_id=-1)
+            robot_spheres = list(sphere_result.get("spheres") or [])
+        except Exception:
+            # Portable to robots without a model-backed planner; their visual
+            # masks still provide the established fallback.
+            robot_spheres = []
     response = ctx.tool(
         "geometry.build_world_config",
         cameras=cameras,
         object_masks=object_masks,
-        voxel_size=float(voxel_size),
-        noise_eps=0.025,
-        noise_min_samples=4,
-        mesh_alpha=0.04,
-        robot_spheres=robot_spheres,
-        robot_sphere_margin=0.015,
+        voxel_size=float(reconstruction.get("voxel_size_m", voxel_size)),
+        noise_eps=float(reconstruction.get("noise_eps_m", 0.025)),
+        noise_min_samples=int(reconstruction.get("noise_min_samples", 4)),
+        mesh_alpha=float(reconstruction.get("mesh_alpha_m", 0.04)),
+        robot_spheres=list(robot_spheres),
+        robot_sphere_margin=float(keep_out.get("robot_sphere_margin_m", 0.015)),
     )
     config = response.get("config") or {"meshes": []}
-
     # Alpha-shape reconstruction can emit isolated, nearly zero-thickness
     # sheets at depth discontinuities. A collision checker treats each such
     # sheet as an exact obstacle; a 2 mm sliver detached from an otherwise
     # represented surface can invalidate a whole roadmap even though it is
     # not a closed occupied volume. Keep real thin objects and compact
     # clutter; reject only small, sparse sheet fragments.
-    cleaned = []
-    for mesh in config.get("meshes") or []:
+    max_vertices = int(filters.get("max_sparse_vertices", 31))
+    sheet_thickness = float(filters.get("min_sheet_thickness_m", 0.004))
+    sparse_span = float(filters.get("max_sparse_span_m", 0.15))
+    compact_span = float(filters.get("max_compact_sparse_span_m", 0.0))
+    floor_z = float(filters.get("valid_workspace_floor_z_m", sheet_floor_z))
+    scene_span = float(filters.get("max_scene_span_m", sheet_max_extent_m))
+    cleaned, removed = [], []
+    for index, mesh in enumerate(config.get("meshes") or []):
         vertices, _ = _mesh_arrays(mesh)
         extent = np.ptp(vertices, axis=0) if len(vertices) else np.zeros(3)
         depth_edge_sliver = bool(
-            0 < len(vertices) < 32 and float(extent.min()) < 0.004 and float(extent.max()) < 0.15
+            0 < len(vertices) <= max_vertices
+            and ((float(extent.min()) < sheet_thickness and float(extent.max()) < sparse_span)
+                 or (compact_span > 0.0 and float(extent.max()) < compact_span))
         )
         # Invalid/far depth from an oblique or wrist camera can back-project
         # into a giant sheet near z=0. It is not part of the workcell, but a
         # collision checker treats it as a real wall or floor.
         invalid_depth_sheet = bool(
             len(vertices)
-            and (
-                (sheet_floor_z > 0.0 and float(vertices[:, 2].max()) < sheet_floor_z)
-                or (sheet_max_extent_m > 0.0 and float(extent.max()) > sheet_max_extent_m)
-            )
+            and ((floor_z > 0.0 and float(vertices[:, 2].max()) < floor_z)
+                 or (scene_span > 0.0 and float(extent.max()) > scene_span))
         )
-        if not depth_edge_sliver and not invalid_depth_sheet:
+        if depth_edge_sliver or invalid_depth_sheet:
+            removed.append(str(mesh.get("name", f"mesh_{index}")))
+        else:
             cleaned.append(mesh)
-    meshes = cleaned
-
-    if fixture_tip is not None and fixture_axis is not None:
+    meshes = cleaned + _keep_out_boxes(profile)
+    if fixture_tip is not None and fixture_axis is not None and corridor.get("enabled", True):
         # The fixture contact zone is intentionally occupied at the goal, and
         # RGB-D alpha shapes can also bridge the thin free space around a
         # shaft. Carve only a narrow perceived approach tube ending at the
         # feature; the rest of the fixture remains an obstacle.
-        outward = float(outward_sign) * _vec(fixture_axis)
+        outward = float(corridor.get("axis_sign", outward_sign)) * _vec(fixture_axis)
         outward /= max(float(np.linalg.norm(outward)), 1.0e-12)
-        meshes = _carve_approach_tube(meshes, _vec(fixture_tip), outward)
-
+        meshes = _carve_approach_tube(
+            meshes, _vec(fixture_tip), outward,
+            axial_min=float(corridor.get("axial_min_m", -0.012)),
+            axial_max=float(corridor.get("axial_max_m", 0.25)),
+            radius=float(corridor.get("radius_m", 0.055)),
+        )
     if corridor_center is not None and float(corridor_radius) > 0.0:
         # Alpha-shape reconstruction may bridge a real lid opening. Preserve
         # a vertical corridor of the caller's measured radius.
         center = np.array([corridor_center["x"], corridor_center["y"]], dtype=np.float64)
         meshes = _carve_corridor(meshes, center, float(corridor_radius), float(corridor_rim_z))
-
     if not meshes:
         raise ValueError("RGB-D collision reconstruction produced no scene mesh")
     if pack_meshes:
@@ -354,4 +450,4 @@ def run(
     mesh_names = [str(mesh["name"]) for mesh in meshes if mesh.get("name")]
     if not mesh_names:
         mesh_names = list(response.get("mesh_names") or [])
-    return {"world_config": config, "mesh_names": mesh_names}
+    return {"world_config": config, "mesh_names": mesh_names, "removed_mesh_names": removed, "strategy": strategy}

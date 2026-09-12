@@ -1,4 +1,28 @@
-"""Plan lift, minimum reorientation, and orientation-locked fixture transit."""
+"""Plan lift, minimum reorientation, and orientation-locked fixture transit.
+
+Three strategies, the first two unchanged from before the profile existed:
+
+- ``clearance_first`` (default): escape along the support normal, rotate in
+  place to the least wrist turn that a planner check accepts, then transit to
+  the staging pose in front of the fixture.
+- ``direct``: escape, then one planned joint leg to a caller-supplied
+  ``approach_pose``.
+- ``direct_cartesian``: escape, then a Cartesian transition to
+  ``approach_pose`` with the collision world and attachment left out -- for a
+  pickup near a reach boundary where a planned leg keeps refusing a start
+  state the executor can simply servo out of.
+
+A graph that carries one profile per object kind passes ``motion_profile``
+(or a ``motion_profiles`` table keyed by ``target_kind``). The profile's
+``strategy`` picks one of the three (``staged_alignment`` is accepted as the
+older name for ``clearance_first``); its other keys are OPTIONAL and, when
+absent, leave the plan exactly as the strategy alone would emit it -- in
+particular ``speed_scale``, ``use_world``, ``max_attempts`` and
+``cartesian_fallback`` appear on a waypoint only when the profile names them,
+because the executor only forwards what a waypoint carries, and a graph that
+never asked for a speed must not start passing one. ``arm_id`` is likewise
+threaded only when set.
+"""
 
 from typing import Any, TypedDict
 
@@ -11,9 +35,17 @@ class Output(TypedDict):
     reorientation_plan: dict[str, Any]
 
 
+_STRATEGY_ALIASES = {"staged_alignment": "clearance_first"}
+_STRATEGIES = {"clearance_first", "direct", "direct_cartesian"}
+
+
+def _vec(value: dict[str, Any]) -> np.ndarray:
+    return np.array([float(value[key]) for key in ("x", "y", "z")], dtype=float)
+
+
 def _rotation(pose: dict[str, Any]) -> Rotation:
     q = pose["rotation"]
-    return Rotation.from_quat([q["x"], q["y"], q["z"], q["w"]])
+    return Rotation.from_quat([float(q["x"]), float(q["y"]), float(q["z"]), float(q["w"])])
 
 
 def _pose(position: np.ndarray, rotation: Rotation) -> dict[str, Any]:
@@ -24,8 +56,31 @@ def _pose(position: np.ndarray, rotation: Rotation) -> dict[str, Any]:
     }
 
 
-def _vec(value: dict[str, float]) -> np.ndarray:
-    return np.array([value[key] for key in ("x", "y", "z")], dtype=np.float64)
+def _resolve_profile(
+    motion_profile: dict[str, Any] | None,
+    target_kind: str,
+    motion_profiles: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if motion_profile is not None:
+        return dict(motion_profile)
+    if not target_kind and not motion_profiles:
+        return {}
+    # Compatibility adapter for already-materialised workflows; new graphs
+    # pass the selected ``motion_profile`` directly.
+    profiles = {str(item["source_kind"]): item for item in (motion_profiles or [])}
+    if target_kind not in profiles:
+        raise ValueError(f"no held-object motion profile declared for profile key {target_kind!r}")
+    return dict(profiles[target_kind])
+
+
+def _leg(pose: dict[str, Any], mode: str, profile: dict[str, Any], *, speed_key: str,
+         **fixed: Any) -> dict[str, Any]:
+    """One waypoint: the fixed keys always, the profile-driven keys only when named."""
+    leg: dict[str, Any] = {"pose": pose, "mode": mode, "cartesian": mode == "contact_transition"}
+    leg.update(fixed)
+    if speed_key in profile:
+        leg["speed_scale"] = float(profile[speed_key])
+    return leg
 
 
 def run(
@@ -41,15 +96,37 @@ def run(
     approach_clearance_m: float = 0.08,
     escape_m: float = 0.06,
     stage_outward_m: float = 0.0,
+    arm_id: int | None = None,
+    target_kind: str = "",
+    motion_profile: dict[str, Any] | None = None,
+    motion_profiles: list[dict[str, Any]] | None = None,
 ) -> Output:
-    if strategy not in {"clearance_first", "direct"}:
+    profile = _resolve_profile(motion_profile, target_kind, motion_profiles)
+    strategy = str(profile.get("strategy", strategy))
+    strategy = _STRATEGY_ALIASES.get(strategy, strategy)
+    if strategy not in _STRATEGIES:
         raise ValueError(f"unsupported carry strategy {strategy!r}")
+    if arm_id is None:
+        carried = attached_object.get("arm_id") if isinstance(attached_object, dict) else None
+        arm_id = None if carried is None else int(carried)
+    on_arm: dict[str, Any] = {} if arm_id is None else {"arm_id": int(arm_id)}
+    plan_head: dict[str, Any] = dict(on_arm)  # the plan names its arm only when one was named
     normal = _vec(support_normal or {"x": 0.0, "y": 0.0, "z": 1.0})
     normal /= max(float(np.linalg.norm(normal)), 1.0e-12)
-    if strategy == "direct":
+
+    def optional(keys: dict[str, str]) -> dict[str, Any]:
+        """``{waypoint key: profile key}`` -> the ones the profile names, typed."""
+        out: dict[str, Any] = {}
+        for waypoint_key, profile_key in keys.items():
+            if profile_key in profile:
+                value = profile[profile_key]
+                out[waypoint_key] = int(value) if waypoint_key == "max_attempts" else bool(value)
+        return out
+
+    if strategy in {"direct", "direct_cartesian"}:
         if approach_pose is None:
             raise ValueError("direct carry requires an approach pose")
-        ee = ctx.tool("robot.get_ee_pose")["pose"]
+        ee = ctx.tool("robot.get_ee_pose", **on_arm)["pose"]
         current_position = _vec(ee["position"])
         current_rotation = _rotation(ee)
         # Move the newly attached object out of residual support/target depth
@@ -58,24 +135,43 @@ def run(
         # clearance is governed by the held body's thickness at the hand, not
         # by spheres at the far ends of a long axis. The executor plans the
         # single joint leg to the approach pose from that lifted state.
-        escape_pose = _pose(current_position + float(escape_m) * normal, current_rotation)
+        escape = float(profile.get("escape_distance_m", escape_m))
+        escape_pose = _pose(current_position + escape * normal, current_rotation)
+        if strategy == "direct":
+            transit = {
+                "pose": approach_pose, "mode": "planned_joint", "cartesian": False,
+                "allow_start_contact": True, "max_attempts": 3,
+            }
+            time_scale = float(profile.get("time_scale", 2.0))
+        else:
+            # Do not demand a large wrist rotation at the pickup position: near
+            # a workspace boundary it can be outside the arm's orientation
+            # range even though the destination is reachable. Move up and in
+            # and rotate in one smooth Cartesian transition to the already
+            # validated approach pose; residual RGB-D fragments and the
+            # conservative attachment fit are omitted for this monotone
+            # free-space segment.
+            transit = _leg(
+                approach_pose, "contact_transition", profile, speed_key="transit_speed_scale",
+                use_attachment=bool(profile.get("use_attachment", False)),
+                use_world=bool(profile.get("use_world", False)),
+                max_attempts=int(profile.get("max_attempts", 3)),
+                cartesian_fallback=bool(profile.get("cartesian_fallback", True)),
+            )
+            time_scale = float(profile.get("time_scale", 1.25))
         return {
             "reorientation_plan": {
-                "time_scale": 2.0,
+                **plan_head,
+                "time_scale": time_scale,
                 "waypoints": [
-                    {"pose": escape_pose, "mode": "contact_transition", "cartesian": True},
-                    {
-                        "pose": approach_pose,
-                        "mode": "planned_joint",
-                        "cartesian": False,
-                        "allow_start_contact": True,
-                        "max_attempts": 3,
-                    },
+                    _leg(escape_pose, "contact_transition", profile, speed_key="lift_speed_scale"),
+                    transit,
                 ],
                 "world_config": world_config,
                 "attached_object": attached_object,
             }
         }
+
     if relation not in {
         "shaft_into_aperture",
         "tip_through_aperture",
@@ -91,7 +187,7 @@ def run(
     axis = _vec(axis_value)
     axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
 
-    ee = ctx.tool("robot.get_ee_pose")["pose"]
+    ee = ctx.tool("robot.get_ee_pose", **on_arm)["pose"]
     current_rotation = _rotation(ee)
     current_position = _vec(ee["position"])
     feature_rotation = _rotation(held_feature_in_tcp)
@@ -108,7 +204,11 @@ def run(
     # inserting tip stages on the opposite side.
     direction = 1.0 if relation == "loop_over_shaft" else -1.0
     feature_target = fixture_center + direction * clearance * axis
-    if stage_outward_m > 0.0:
+    # ``horizontal_staging_offset_m`` is the profile's name for the same
+    # thing; the offset is taken in the support plane, which for a level bench
+    # is the horizontal plane.
+    outward_m = float(profile.get("horizontal_staging_offset_m", stage_outward_m))
+    if outward_m > 0.0:
         # A recessed opening is often observed most strongly at its far rim.
         # Stage over the interior instead of directly above that depth return:
         # shift the staging target within the support plane, away from the
@@ -117,14 +217,24 @@ def run(
         outward -= normal * float(outward @ normal)
         outward_norm = float(np.linalg.norm(outward))
         if outward_norm > 1.0e-6:
-            feature_target = feature_target + float(stage_outward_m) * outward / outward_norm
+            feature_target = feature_target + outward_m * outward / outward_norm
+    validate = bool(profile.get("validate_symmetry_with_planner", True))
     candidates = []
     for angle in np.deg2rad([0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0]):
         rotation = Rotation.from_rotvec(axis * float(angle)) * aligned
         hand_position = feature_target - rotation.apply(feature_offset)
         candidate = _pose(hand_position, rotation)
+        # Geodesic TCP rotation is the stable, robot-independent score. It
+        # prevents symmetry from producing an arbitrary large wrist turn.
+        turn = float((rotation * current_rotation.inv()).magnitude())
+        if not validate:
+            # A Cartesian-only profile deliberately never invokes the planner,
+            # not even as a candidate filter; the Cartesian executor reports a
+            # genuinely unreachable pose.
+            candidates.append((turn, abs(float(angle)), candidate, rotation))
+            continue
         try:
-            check = ctx.tool("motion.plan_joint", pose=candidate, orientation="lock")
+            check = ctx.tool("motion.plan_joint", pose=candidate, orientation="lock", **on_arm)
         except Exception:
             continue
         if not check.get("planned"):
@@ -133,9 +243,6 @@ def run(
             continue
         if float(check.get("rotation_error_rad", 0.0)) > np.deg2rad(4.0):
             continue
-        # Geodesic TCP rotation is the stable, robot-independent score. It
-        # prevents symmetry from producing an arbitrary large wrist turn.
-        turn = float((rotation * current_rotation.inv()).magnitude())
         candidates.append((turn, abs(float(angle)), candidate, rotation))
     if not candidates:
         raise RuntimeError("no feasible orientation aligns the held feature with the fixture")
@@ -154,22 +261,25 @@ def run(
     escape_distance = max(0.04, max(extents, default=0.025) + 0.015)
     escape_position = current_position + escape_distance * normal
     rotate_pose = _pose(escape_position, goal_rotation)
+    # A profile may ask for the in-place rotation, or the transit, to be a
+    # Cartesian transition instead of a planned leg when the local volume is
+    # known to be clear; unasked, both are planned as they always were.
+    reorient_mode = "contact_transition" if bool(profile.get("cartesian_reorient", False)) else "planned_joint"
+    transit_mode = "contact_transition" if bool(profile.get("cartesian_transit", False)) else "planned_joint"
     return {
         "reorientation_plan": {
-            "time_scale": 2.0,
+            **plan_head,
+            "time_scale": float(profile.get("time_scale", 2.0)),
             "waypoints": [
-                {
-                    "pose": _pose(escape_position, current_rotation),
-                    "mode": "contact_transition",
-                    "cartesian": True,
-                },
-                {
-                    "pose": rotate_pose,
-                    "mode": "planned_joint",
-                    "cartesian": False,
-                    "use_attachment": False,
-                },
-                {"pose": transit_pose, "mode": "planned_joint", "cartesian": False},
+                _leg(_pose(escape_position, current_rotation), "contact_transition", profile,
+                     speed_key="lift_speed_scale"),
+                _leg(rotate_pose, reorient_mode, profile, speed_key="reorient_speed_scale",
+                     use_attachment=bool(profile.get("reorient_use_attachment", False)),
+                     **optional({"use_world": "reorient_use_world", "max_attempts": "max_attempts",
+                                 "cartesian_fallback": "cartesian_fallback"})),
+                _leg(transit_pose, transit_mode, profile, speed_key="transit_speed_scale",
+                     **optional({"use_attachment": "transit_use_attachment", "use_world": "transit_use_world",
+                                 "max_attempts": "max_attempts", "cartesian_fallback": "transit_cartesian_fallback"})),
             ],
             "world_config": world_config,
             "attached_object": attached_object,

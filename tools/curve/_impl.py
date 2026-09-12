@@ -90,16 +90,73 @@ _MERGE_WARNED: list[bool] = []
 this runs every frame of every episode."""
 
 
+def _skeleton_geodesic(thin: np.ndarray) -> np.ndarray:
+    """The longest endpoint-to-endpoint geodesic through a thinned mask.
+
+    A clean cable mask is a one-pixel-wide graph with two ends, so the ordered
+    centreline is a path through that graph -- not a sort. Build it 8-connected
+    with true diagonal cost and take the longest finite endpoint-to-endpoint
+    geodesic. Returns ``(N, 2)`` upscaled pixel coordinates, or empty when the
+    skeleton has fewer than two ends (a loop) or no path of useful length.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    vv, uu = np.nonzero(thin)
+    if len(uu) < 4:
+        return np.zeros((0, 2))
+    ids = np.full(thin.shape, -1, dtype=np.int32)
+    ids[vv, uu] = np.arange(len(uu), dtype=np.int32)
+    rows: list[int] = []
+    cols: list[int] = []
+    weights: list[float] = []
+    for dv, du, cost in ((0, 1, 1.0), (1, -1, 2.0 ** 0.5), (1, 0, 1.0), (1, 1, 2.0 ** 0.5)):
+        valid = (vv + dv < thin.shape[0]) & (uu + du >= 0) & (uu + du < thin.shape[1])
+        src = np.nonzero(valid)[0]
+        dst = ids[vv[src] + dv, uu[src] + du]
+        keep = dst >= 0
+        for a, b in zip(src[keep], dst[keep], strict=True):
+            rows.extend((int(a), int(b)))
+            cols.extend((int(b), int(a)))
+            weights.extend((cost, cost))
+    graph = coo_matrix((weights, (rows, cols)), shape=(len(uu), len(uu))).tocsr()
+    ends = np.flatnonzero(np.diff(graph.indptr) == 1)
+    if len(ends) < 2:
+        return np.zeros((0, 2))
+    distances, predecessors = dijkstra(graph, directed=False, indices=ends, return_predecessors=True)
+    distances = np.where(np.isfinite(distances), distances, -1.0)
+    ei, target = np.unravel_index(int(np.argmax(distances)), distances.shape)
+    source = int(ends[ei])
+    current = int(target)
+    path = [current]
+    while current != source and current >= 0:
+        current = int(predecessors[ei, current])
+        if current >= 0:
+            path.append(current)
+    if len(path) < 4 or path[-1] != source:
+        return np.zeros((0, 2))
+    path.reverse()
+    return np.stack([uu[path], vv[path]], axis=1).astype(np.float64)
+
+
 def _ordered_pixels(mask: np.ndarray) -> np.ndarray:
     """The mask's skeleton as one ordered ``(N, 2)`` pixel chain.
 
-    TrackDLO's merge first, which is the only part that can order a skeleton
-    broken by occlusion or crossing itself. Its failure is not an error -- a
-    single clean blob gives the assignment nothing to assign -- so a thinned
-    fallback follows, ordered along its principal axis. The fallback
-    skeletonises too: ordering the *filled* mask by PCA returns every pixel,
-    which is not a centreline and quietly poisons anything measured from its
-    length.
+    **Traverse the skeleton; do not sort it.** A one-pixel-wide mask is a graph
+    with two ends, and its ordered centreline is the longest geodesic between
+    them (:func:`_skeleton_geodesic`). Ordering by principal axis instead
+    interleaves neighbouring rows of a CURVED skeleton, and the zigzag it
+    creates is counted as length: measured on the routing scenes, the same
+    600 mm cable read 1152 mm through the PCA path and 598 mm through the
+    geodesic, and every slack figure a routing graph computes is derived from
+    that number.
+
+    TrackDLO's merge follows, because it is the only part that can order a
+    skeleton broken by occlusion or crossing itself -- the geodesic declines
+    that case by returning empty rather than pathing through a gap. The PCA
+    sort remains last, for a skeleton that is neither traversable nor
+    mergeable; it skeletonises too, since ordering the *filled* mask returns
+    every pixel, which is not a centreline at all.
     """
     import cv2
     from gap_skills.tools.curve._trackdlo import extract_connected_skeleton
@@ -107,6 +164,9 @@ def _ordered_pixels(mask: np.ndarray) -> np.ndarray:
 
     m = (np.asarray(mask) > 0).astype(np.uint8) * 255
     big = cv2.resize(m, None, fx=UPSCALE, fy=UPSCALE, interpolation=cv2.INTER_NEAREST)
+    geodesic = _skeleton_geodesic(skeletonize(big > 0).astype(np.uint8))
+    if len(geodesic) >= 8:
+        return geodesic / float(UPSCALE)
     try:
         chains = extract_connected_skeleton(False, big, img_scale=1)
     except Exception as exc:
@@ -330,6 +390,7 @@ def track_centerline(
     vis_floor: float = TRACK_VIS_FLOOR,
     iters: int = TRACK_ITERS,
     stiffness: float = TRACK_STIFFNESS,
+    radius: float | None = None,
 ) -> dict[str, Any]:
     """Advance a known centreline onto a new frame. TrackDLO's idea, compactly.
 
@@ -373,8 +434,28 @@ def track_centerline(
     # camera each pass -- the same surface-vs-axis bias :func:`_to_axis`
     # documents, applied repeatedly rather than once. Corrected on the way in so
     # the correspondence is axis-to-axis.
+    #
+    # THE RADIUS TO CORRECT BY IS THE ONE THE OPENING SURVEY MEASURED, not this
+    # frame's. :func:`_cloud_radius` is area over length, and on a tracking
+    # frame both of its terms are wrong in the same direction: a mask that
+    # caught a fingertip, a bench highlight or the arm's own shadow gains area,
+    # while an occluded rod loses the length that area is divided by. Measured
+    # on a saved carry frame that ratio returned 23.15 mm against the opening
+    # camera's 3.47 mm, on a rod whose radius is a constant of the scene -- and
+    # :func:`_to_axis` then pushed every node 23 mm along its view ray, putting
+    # the reconstructed cable through the bench it is lying on. A rod does not
+    # change radius during an episode, so the opening measurement is the better
+    # estimator on every later frame and a caller that has one should pass it.
+    #
+    # ``None`` keeps the per-frame estimate, so a caller that never surveyed --
+    # which is every caller that existed before this argument -- does not move.
     if len(X):
-        X = _to_axis(X, T, _cloud_radius(mask, depth, K, _arclength(Y)))
+        skin = (
+            float(radius)
+            if radius is not None and float(radius) > 0.0
+            else _cloud_radius(mask, depth, K, _arclength(Y))
+        )
+        X = _to_axis(X, T, skin)
     if len(X) < 8:
         return {
             "points": [[float(v) for v in p] for p in Y],

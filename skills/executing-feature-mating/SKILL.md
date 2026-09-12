@@ -5,7 +5,7 @@ license: Apache-2.0
 compatibility: requires gap>=0.1
 metadata: {category: motion, tags: [motion, placement, insertion, fixtures, release]}
 gap:
-  requires: {connector: [motion.plan_to_pose, motion.plan_linear, robot.move_cartesian_until_contact, robot.wait_steps]}
+  requires: {connector: [motion.plan_to_pose, motion.plan_linear, robot.move_cartesian_until_contact, robot.wait_steps, robot.describe_arm]}
   allowed_tools:
     - robot.get_ee_pose
     - robot.execute_trajectory
@@ -15,6 +15,13 @@ gap:
     - robot.wait_steps
     - motion.plan_to_pose
     - motion.plan_linear
+  produces_outputs:
+    final_pose: Se3Pose
+    waypoint_count: int
+    fallback_count: int
+    registration_uncertainty_m: float
+    released: bool
+    retreat_pose: Se3Pose
   exit_conditions:
     seated: The feature-mating waypoint sequence completed; the object is engaged with the fixture and still held.
     released: The gripper opened at the mate and retreated clear of the released object.
@@ -26,6 +33,16 @@ gap:
     - release_and_retract: scripts/release_and_retract.py
   streaming: false
 ---
+
+Both scripts also return a report -- `waypoint_reports` (one record per
+waypoint) from `execute_placement_plan`, `release_report` from
+`release_and_retract` -- stated here rather than under `produces_outputs`
+because the type registry names no bare list or record. A `contact_profile`
+(one per object kind) overrides the executor's tolerances one key at a time;
+`arm_id` names the hand on a bimanual cell; `verify_cartesian` and
+`measure_errors` turn on the TCP re-reads that fill the reports (they are
+recorded tool calls and are off unless asked). `robot.describe_arm` is called
+only under `verify_cartesian`, to learn whether the solver honours roll.
 
 # executing-feature-mating
 

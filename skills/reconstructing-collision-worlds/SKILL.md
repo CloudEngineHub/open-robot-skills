@@ -15,11 +15,13 @@ gap:
     target_mask: Mask
   produces_outputs:
     world_config: WorldConfig
+    strategy: string
   exit_conditions:
     built: A scene mesh set with the goal's free space carved was produced.
     failed: No camera was selected or the reconstruction produced no scene mesh (raised).
   canonical_scripts:
     - build_collision_world: scripts/build_collision_world.py
+    - filter_mesh_components: scripts/filter_mesh_components.py
   streaming: false
 ---
 

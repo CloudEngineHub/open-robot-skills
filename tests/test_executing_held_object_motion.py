@@ -169,7 +169,10 @@ def test_approach_only_executes_waypoint_zero_with_tight_tracking():
     executed = ctx.calls[1][1]
     assert executed["tolerance"] == pytest.approx(0.002)
     assert executed["max_steps_per_waypoint"] == 60
-    assert result == {"approach_pose": _pose(0.1)}
+    # The call sequence is the contract; outputs may GROW but only by declared keys.
+    assert result["approach_pose"] == _pose(0.1)
+    assert set(result) == {"approach_pose", "waypoint_report"}
+    assert result["waypoint_report"]["method"] == "planned"
     assert all("gripper" not in name for name, _ in ctx.calls)
 
 

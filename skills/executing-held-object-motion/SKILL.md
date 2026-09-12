@@ -11,6 +11,12 @@ gap:
     - motion.plan_linear
     - robot.execute_trajectory
     - robot.go_to_pose_cartesian
+    - robot.get_ee_pose
+  produces_outputs:
+    final_pose: Se3Pose
+    approach_pose: Se3Pose
+    fallback_count: int
+    registration_uncertainty_m: float
   exit_conditions:
     reoriented: The held-object waypoint sequence completed while the gripper remained closed.
     reached: Only the first (approach) waypoint of a placement plan was executed; the object is held at the approach pose.
@@ -22,6 +28,15 @@ gap:
     - execute_approach_only: scripts/execute_approach_only.py
   streaming: false
 ---
+
+Both scripts also return a per-waypoint report (`waypoint_reports`,
+`waypoint_report`), stated here because the type registry names no bare list
+or record. An `execution_profile` (one per object kind) adds `speed_scale`, a
+Cartesian fallback when the planner refuses, and -- for the approach -- a local
+Cartesian shortcut and a goal-contact retry; `robot.get_ee_pose` is read only
+under a profile (`execute_approach_only`) or `measure_errors`
+(`execute_reorientation`), because the read is a recorded tool call. `arm_id`
+names the hand on a bimanual cell and is absent from every call when unset.
 
 # executing-held-object-motion
 

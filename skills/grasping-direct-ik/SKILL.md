@@ -17,6 +17,8 @@ gap:
   allowed_tools:
     - geometry.top_down_grasp_candidates
     - robot.go_to_pose
+    - robot.go_to_pose_cartesian
+    - robot.get_ee_pose
     - robot.open_gripper
     - robot.close_gripper
     - robot.describe_workspace
@@ -52,6 +54,7 @@ gap:
   canonical_scripts:
     - compute_align_pose: scripts/compute_align_pose.py
     - refine_top_down_grasp: scripts/refine_top_down_grasp.py
+    - execute_grasp_align: scripts/execute_grasp_align.py
     - plan_to_pose: scripts/plan_to_pose.py
   references:
     - title: Why pre-rotate-then-descend instead of blended rotate+descend?
