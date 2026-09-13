@@ -92,7 +92,7 @@ def run(
     feature_center: Vec3,
     feature_axis: Vec3,
     standoff: float = 0.12,
-    grasp_z_offset: float = 0.015,
+    grasp_z_offset: float = 0.014,
     bin_floor_z: float | None = None,
     target_cloud: Any = None,
 ) -> Output:
@@ -124,6 +124,36 @@ def run(
     tool_x /= max(float(np.linalg.norm(tool_x)), 1e-9)
     tool_y = np.cross(approach, tool_x)
     tool_y /= max(float(np.linalg.norm(tool_y)), 1e-9)
+
+    # The two 180°-equivalent jaw orientations (symmetric gripper) differ only
+    # in the sign of tool_x/tool_y and require j7 angles ~π apart. Choose the
+    # one that keeps joint 7 within its ±2.897 rad limit and closest to its
+    # current position, using R(j1..j6) = R_ee · Rz(-j7) to back out the
+    # arm's contribution and isolate what j7 each orientation demands.
+    _J7_LIM = 2.897
+    try:
+        _obs = ctx.tool("robot.get_observation")
+        _j7 = float(_obs["arms"][0]["joint_state"]["positions"][-1])
+        _ee_r = ctx.tool("robot.get_ee_pose")["pose"]["rotation"]
+        _R_ee = Rotation.from_quat(
+            [_ee_r["x"], _ee_r["y"], _ee_r["z"], _ee_r["w"]]
+        ).as_matrix()
+        _R_j16 = _R_ee @ Rotation.from_euler("z", -_j7).as_matrix()
+        _u = _R_j16.T @ tool_x
+        _j7_prim = float(np.arctan2(_u[1], _u[0]))
+        _j7_alt = float(((_j7_prim + np.pi) + np.pi) % (2 * np.pi) - np.pi)
+        _prim_ok = abs(_j7_prim) <= _J7_LIM
+        _alt_ok = abs(_j7_alt) <= _J7_LIM
+        _use_alt = _alt_ok and (
+            not _prim_ok
+            or abs(_j7_alt - _j7) < abs(_j7_prim - _j7)
+        )
+        if _use_alt:
+            tool_x = -tool_x
+            tool_y = -tool_y
+    except Exception:
+        pass  # fall back to primary orientation if state is unavailable
+
     rotation = np.column_stack((tool_x, tool_y, approach))
     q = Rotation.from_matrix(rotation).as_quat()  # xyzw
     quaternion = {"w": float(q[3]), "x": float(q[0]), "y": float(q[1]), "z": float(q[2])}

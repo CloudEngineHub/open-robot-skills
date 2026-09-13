@@ -405,7 +405,7 @@ def run(
     min_arc_m: float = 0.005,
     min_concavity: float = 0.26,
     max_candidates: int = 24,
-    grasp_z_offset: float = 0.015,
+    grasp_z_offset: float = 0.014,
 ) -> Output:
     # ------------------------------------------------------------------ cloud
     name = object_name
